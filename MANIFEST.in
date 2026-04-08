@@ -1,0 +1,1 @@
+recursive-exclude two_layer_hnsw_like_cpp/data *
