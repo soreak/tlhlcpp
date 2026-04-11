@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import numpy as np
-from sklearn.cluster import KMeans
 
-from .CPD_Kmeans_old import CPD_KMeans, CenterHyperplaneRouter
 from ._tlhl_cpp import TLHLCore
+
+if TYPE_CHECKING:
+    from .CPD_Kmeans_old import CenterHyperplaneRouter
 
 
 @dataclass
@@ -29,10 +30,23 @@ class IndexParams:
     cpd_mean_sample: int = 64
     cpd_mean_exact_k: int = 512
 
-    # query-structure optimizations
+    # query / structure
     anchor_k: int = 4
     ef_extra: int = 64
     center_probe_ef_cap: int = 16
+
+    adaptive_probe: bool = True
+    adaptive_ef_extra: bool = True
+    min_probe_centers: int = 1
+    max_probe_centers: int = 8
+    route_margin_low: float = 0.05
+    route_margin_high: float = 0.20
+
+    # parallel search_many
+    num_threads: int = 0
+
+    # virtual node rewrite
+    finalize_virtual_nodes: bool = True
 
     def __post_init__(self) -> None:
         if self.n_centers <= 0:
@@ -55,6 +69,17 @@ class IndexParams:
             raise ValueError("ef_extra 必须 >= 0")
         if self.center_probe_ef_cap <= 0:
             raise ValueError("center_probe_ef_cap 必须 > 0")
+        if self.min_probe_centers <= 0:
+            raise ValueError("min_probe_centers 必须 > 0")
+        if self.max_probe_centers < self.min_probe_centers:
+            raise ValueError("max_probe_centers 必须 >= min_probe_centers")
+        if self.route_margin_low < 0 or self.route_margin_high < 0:
+            raise ValueError("route margin 必须 >= 0")
+        if self.route_margin_high < self.route_margin_low:
+            raise ValueError("route_margin_high 必须 >= route_margin_low")
+        if self.num_threads < 0:
+            raise ValueError("num_threads 必须 >= 0")
+
         self.cluster_method = str(self.cluster_method).lower()
         if self.cluster_method not in {"cpd_kmeans", "kmeans"}:
             raise ValueError("cluster_method 必须是 'cpd_kmeans' 或 'kmeans'")
@@ -67,25 +92,28 @@ def _to_float32_matrix(X: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(X)
 
 
-def _flatten_router(router: Optional[CenterHyperplaneRouter], dim: int):
+def _flatten_router(router: Optional[Any], dim: int):
     if router is None:
         return (
             np.empty((0, dim), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
             np.empty((0,), dtype=np.int32),
             np.empty((0,), dtype=np.int32),
             np.empty((0,), dtype=np.int32),
         )
 
-    normals: List[np.ndarray] = []
-    bias: List[float] = []
-    left: List[int] = []
-    right: List[int] = []
-    leaf_center: List[int] = []
+    normals = []
+    normal_norms = []
+    bias = []
+    left = []
+    right = []
+    leaf_center = []
 
     def build(node) -> int:
         idx = len(bias)
         normals.append(np.zeros((dim,), dtype=np.float32))
+        normal_norms.append(0.0)
         bias.append(0.0)
         left.append(-1)
         right.append(-1)
@@ -95,7 +123,9 @@ def _flatten_router(router: Optional[CenterHyperplaneRouter], dim: int):
             leaf_center[idx] = int(node.center_ids[0])
             return idx
 
-        normals[idx] = np.asarray(node.normal, dtype=np.float32)
+        n = np.asarray(node.normal, dtype=np.float32)
+        normals[idx] = n
+        normal_norms[idx] = float(np.linalg.norm(n))
         bias[idx] = float(node.bias)
         left[idx] = build(node.left)
         right[idx] = build(node.right)
@@ -104,6 +134,7 @@ def _flatten_router(router: Optional[CenterHyperplaneRouter], dim: int):
     build(router.root)
     return (
         np.ascontiguousarray(np.vstack(normals).astype(np.float32)),
+        np.asarray(normal_norms, dtype=np.float32),
         np.asarray(bias, dtype=np.float32),
         np.asarray(left, dtype=np.int32),
         np.asarray(right, dtype=np.int32),
@@ -120,12 +151,12 @@ def _build_center_anchors(
 ) -> tuple[np.ndarray, np.ndarray]:
     K = centers.shape[0]
     offsets = np.zeros((K + 1,), dtype=np.int64)
-    all_ids: List[np.ndarray] = []
+    chunks = []
 
     for cid in range(K):
         members = np.where(labels == cid)[0]
         if members.size == 0:
-            all_ids.append(np.empty((0,), dtype=np.int32))
+            chunks.append(np.empty((0,), dtype=np.int32))
             offsets[cid + 1] = offsets[cid]
             continue
 
@@ -135,31 +166,17 @@ def _build_center_anchors(
         sel = np.argpartition(dists, take - 1)[:take]
         sel = sel[np.argsort(dists[sel])]
         graph_ids = (members[sel] + virtual_base_count).astype(np.int32, copy=False)
-        all_ids.append(graph_ids)
+        chunks.append(graph_ids)
         offsets[cid + 1] = offsets[cid] + graph_ids.size
 
     if offsets[-1] == 0:
         indices = np.empty((0,), dtype=np.int32)
     else:
-        indices = np.concatenate(all_ids).astype(np.int32, copy=False)
+        indices = np.concatenate(chunks).astype(np.int32, copy=False)
     return offsets, indices
 
 
 class TwoLayerHNSWLikeIndexCPP:
-    """
-    C++ core TLHL implementation.
-
-    Python is responsible for:
-    - balanced clustering
-    - flattening the router tree
-    - extracting center anchors
-
-    C++ is responsible for:
-    - center/base graph construction
-    - CSR conversion
-    - query path
-    """
-
     def __init__(
         self,
         n_centers: int,
@@ -179,6 +196,14 @@ class TwoLayerHNSWLikeIndexCPP:
         anchor_k: int = 4,
         ef_extra: int = 64,
         center_probe_ef_cap: int = 16,
+        adaptive_probe: bool = True,
+        adaptive_ef_extra: bool = True,
+        min_probe_centers: int = 1,
+        max_probe_centers: int = 8,
+        route_margin_low: float = 0.05,
+        route_margin_high: float = 0.20,
+        num_threads: int = 0,
+        finalize_virtual_nodes: bool = True,
     ):
         self.params = IndexParams(
             n_centers=n_centers,
@@ -198,6 +223,14 @@ class TwoLayerHNSWLikeIndexCPP:
             anchor_k=anchor_k,
             ef_extra=ef_extra,
             center_probe_ef_cap=center_probe_ef_cap,
+            adaptive_probe=adaptive_probe,
+            adaptive_ef_extra=adaptive_ef_extra,
+            min_probe_centers=min_probe_centers,
+            max_probe_centers=max_probe_centers,
+            route_margin_low=route_margin_low,
+            route_margin_high=route_margin_high,
+            num_threads=num_threads,
+            finalize_virtual_nodes=finalize_virtual_nodes,
         )
 
         self.data_vectors: Optional[np.ndarray] = None
@@ -205,22 +238,37 @@ class TwoLayerHNSWLikeIndexCPP:
         self.centers: Optional[np.ndarray] = None
         self.labels_: Optional[np.ndarray] = None
         self.virtual_base_count: int = 0
-        self.center_router: Optional[CenterHyperplaneRouter] = None
+        self.center_router: Optional[Any] = None
         self.core: Optional[TLHLCore] = None
 
-    def _cluster_points(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        if self.params.cluster_method == "kmeans":
-            kmeans = KMeans(
-                n_clusters=self.params.n_centers,
-                random_state=self.params.random_state,
-                n_init=10,
-                max_iter=self.params.cluster_max_iter,
-                tol=self.params.cluster_tol,
-            )
-            labels = kmeans.fit_predict(X)
-            centers = kmeans.cluster_centers_.astype(np.float32, copy=False)
-            self.center_router = CenterHyperplaneRouter(centers)
-            return centers, labels.astype(np.int32, copy=False)
+    def _cluster_kmeans(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        try:
+            from sklearn.cluster import KMeans
+        except Exception as e:
+            raise RuntimeError(f"导入 sklearn.cluster.KMeans 失败: {e}") from e
+
+        try:
+            from .CPD_Kmeans_old import CenterHyperplaneRouter
+        except Exception as e:
+            raise RuntimeError(f"导入 CenterHyperplaneRouter 失败: {e}") from e
+
+        kmeans = KMeans(
+            n_clusters=self.params.n_centers,
+            random_state=self.params.random_state,
+            n_init=10,
+            max_iter=self.params.cluster_max_iter,
+            tol=self.params.cluster_tol,
+        )
+        labels = kmeans.fit_predict(X)
+        centers = kmeans.cluster_centers_.astype(np.float32, copy=False)
+        self.center_router = CenterHyperplaneRouter(centers)
+        return centers, labels.astype(np.int32, copy=False)
+
+    def _cluster_cpd(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        try:
+            from .CPD_Kmeans_old import CPD_KMeans
+        except Exception as e:
+            raise RuntimeError(f"导入 CPD_KMeans 失败: {e}") from e
 
         cpd = CPD_KMeans(
             data=X,
@@ -235,10 +283,35 @@ class TwoLayerHNSWLikeIndexCPP:
             mean_exact_k=self.params.cpd_mean_exact_k,
         )
         centers, labels = cpd.train()
-        centers = np.asarray(centers, dtype=np.float32, order="C")
-        labels = np.asarray(labels, dtype=np.int32)
         self.center_router = cpd.router_
-        return centers, labels
+        return (
+            np.asarray(centers, dtype=np.float32, order="C"),
+            np.asarray(labels, dtype=np.int32),
+        )
+
+    def _cluster_points(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        self.center_router = None
+        if self.params.cluster_method == "kmeans":
+            return self._cluster_kmeans(X)
+        return self._cluster_cpd(X)
+
+    def _create_core(self) -> TLHLCore:
+        return TLHLCore(
+            self.params.m,
+            self.params.ef_construction,
+            self.params.center_max_degree,
+            self.params.base_max_degree,
+            self.params.ef_extra,
+            self.params.anchor_k,
+            self.params.center_probe_ef_cap,
+            self.params.min_probe_centers,
+            self.params.max_probe_centers,
+            float(self.params.route_margin_low),
+            float(self.params.route_margin_high),
+            bool(self.params.adaptive_probe),
+            bool(self.params.adaptive_ef_extra),
+            int(self.params.num_threads),
+        )
 
     def fit(self, X: np.ndarray) -> "TwoLayerHNSWLikeIndexCPP":
         X = _to_float32_matrix(X)
@@ -249,16 +322,17 @@ class TwoLayerHNSWLikeIndexCPP:
         self.data_vectors = X
         self.centers, self.labels_ = self._cluster_points(X)
         self.virtual_base_count = int(self.centers.shape[0])
-        self.base_vectors = np.ascontiguousarray(np.vstack([self.centers, self.data_vectors]).astype(np.float32))
+        self.base_vectors = np.ascontiguousarray(
+            np.vstack([self.centers, self.data_vectors]).astype(np.float32)
+        )
 
-        if self.center_router is not None:
-            insertion_entry_points = self.center_router.route_many(self.data_vectors).astype(np.int32, copy=False)
+        if self.center_router is not None and hasattr(self.center_router, "route_many"):
+            insertion_entry_points = self.center_router.route_many(self.data_vectors).astype(
+                np.int32, copy=False
+            )
         else:
             insertion_entry_points = self.labels_.astype(np.int32, copy=False)
 
-        router_normals, router_bias, router_left, router_right, router_leaf_center = _flatten_router(
-            self.center_router, self.base_vectors.shape[1]
-        )
         anchor_offsets, anchor_indices = _build_center_anchors(
             centers=self.centers,
             labels=self.labels_,
@@ -267,61 +341,64 @@ class TwoLayerHNSWLikeIndexCPP:
             anchor_k=self.params.anchor_k,
         )
 
-        self.core = TLHLCore(
-            m=int(self.params.m),
-            ef_construction=int(self.params.ef_construction),
-            center_max_degree=int(self.params.center_max_degree),
-            base_max_degree=int(self.params.base_max_degree),
-            ef_extra=int(self.params.ef_extra),
-            anchor_k=int(self.params.anchor_k),
-            center_probe_ef_cap=int(self.params.center_probe_ef_cap),
+        router_normals, router_norms, router_bias, router_left, router_right, router_leaf_center = _flatten_router(
+            self.center_router, self.base_vectors.shape[1]
         )
-        self.core.build(
-            np.ascontiguousarray(self.centers),
-            np.ascontiguousarray(self.base_vectors),
-            np.ascontiguousarray(insertion_entry_points, dtype=np.int32),
-        )
+
+        self.core = self._create_core()
+        self.core.build(self.centers, self.base_vectors, insertion_entry_points)
         self.core.set_router(
-            np.ascontiguousarray(router_normals),
-            np.ascontiguousarray(router_bias),
-            np.ascontiguousarray(router_left),
-            np.ascontiguousarray(router_right),
-            np.ascontiguousarray(router_leaf_center),
+            router_normals,
+            router_norms,
+            router_bias,
+            router_left,
+            router_right,
+            router_leaf_center,
         )
-        self.core.set_center_anchors(
-            np.ascontiguousarray(anchor_offsets),
-            np.ascontiguousarray(anchor_indices),
-        )
+        self.core.set_center_anchors(anchor_offsets, anchor_indices)
+
+        if self.params.finalize_virtual_nodes:
+            self.core.finalize_virtual_nodes()
+
         return self
 
     def search(
         self,
         query: np.ndarray,
         k: int = 10,
-        ef: Optional[int] = None,
+        ef: int = 50,
         n_probe_centers: int = 1,
-    ) -> List[Tuple[int, float]]:
+    ) -> list[tuple[int, float]]:
         if self.core is None:
             raise RuntimeError("请先 fit()")
-        q = np.asarray(query, dtype=np.float32).reshape(-1)
-        if ef is None:
-            ef = max(self.params.ef_construction, k * 4)
-        ids, dists = self.core.search_arrays(q, int(k), int(ef), int(n_probe_centers))
-        return [(int(i), float(d)) for i, d in zip(ids.tolist(), dists.tolist())]
+
+        ids, dists = self.core.search_arrays(
+            np.ascontiguousarray(np.asarray(query, dtype=np.float32)),
+            int(k),
+            int(ef),
+            int(n_probe_centers),
+        )
+        ids = np.asarray(ids, dtype=np.int32)
+        dists = np.asarray(dists, dtype=np.float32)
+        return [(int(i), float(d)) for i, d in zip(ids, dists)]
 
     def search_many(
         self,
         queries: np.ndarray,
         k: int = 10,
-        ef: Optional[int] = None,
+        ef: int = 50,
         n_probe_centers: int = 1,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         if self.core is None:
             raise RuntimeError("请先 fit()")
-        Q = _to_float32_matrix(queries)
-        if ef is None:
-            ef = max(self.params.ef_construction, k * 4)
-        return self.core.search_many_arrays(Q, int(k), int(ef), int(n_probe_centers))
+
+        ids, dists = self.core.search_many_arrays(
+            _to_float32_matrix(queries),
+            int(k),
+            int(ef),
+            int(n_probe_centers),
+        )
+        return np.asarray(ids, dtype=np.int32), np.asarray(dists, dtype=np.float32)
 
     def summary(self) -> dict:
         if self.core is None:
@@ -329,25 +406,25 @@ class TwoLayerHNSWLikeIndexCPP:
                 "built": False,
                 "cluster_method": self.params.cluster_method,
             }
+
         out = dict(self.core.summary())
         out.update(
             {
                 "built": True,
                 "cluster_method": self.params.cluster_method,
-                "n_real_base_nodes": 0 if self.data_vectors is None else int(self.data_vectors.shape[0]),
-                "n_virtual_base_nodes": int(self.virtual_base_count),
-                "n_centers": 0 if self.centers is None else int(self.centers.shape[0]),
-                "anchor_k": int(self.params.anchor_k),
-                "ef_extra": int(self.params.ef_extra),
-                "query_backend": "c++",
+                "n_centers": self.params.n_centers,
+                "m": self.params.m,
+                "ef_construction": self.params.ef_construction,
+                "anchor_k": self.params.anchor_k,
+                "ef_extra": self.params.ef_extra,
+                "adaptive_probe": self.params.adaptive_probe,
+                "adaptive_ef_extra": self.params.adaptive_ef_extra,
+                "min_probe_centers": self.params.min_probe_centers,
+                "max_probe_centers": self.params.max_probe_centers,
+                "route_margin_low": self.params.route_margin_low,
+                "route_margin_high": self.params.route_margin_high,
+                "num_threads": self.params.num_threads,
+                "finalize_virtual_nodes": self.params.finalize_virtual_nodes,
             }
         )
-        if self.labels_ is not None and self.labels_.size > 0:
-            counts = np.bincount(self.labels_, minlength=self.params.n_centers)
-            out["cluster_balance"] = {
-                "min": int(counts.min()),
-                "max": int(counts.max()),
-                "mean": float(counts.mean()),
-                "std": float(counts.std()),
-            }
         return out

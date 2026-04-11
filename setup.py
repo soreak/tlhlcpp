@@ -1,5 +1,5 @@
 from pathlib import Path
-from setuptools import setup
+from setuptools import setup, find_packages
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 import numpy as np
 
@@ -23,14 +23,15 @@ setup(
     long_description=README,
     long_description_content_type="text/markdown",
     author="OpenAI",
-    packages=["two_layer_hnsw_like_cpp"],
+    packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
     python_requires=">=3.10",
     install_requires=[
-        "numpy>=1.24",
-        "scikit-learn>=1.2",
-        "faiss-cpu>=1.7.4",
+        "numpy<2",
+        "scipy<1.11",
+        "scikit-learn<1.4",
+        "faiss-cpu==1.7.4",
     ],
     extras_require={
         "dev": ["pytest>=8.0"],
