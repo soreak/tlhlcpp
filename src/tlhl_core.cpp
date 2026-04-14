@@ -1,4 +1,4 @@
-#include <pybind11/pybind11.h>
+﻿#include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
@@ -13,6 +13,10 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <string>
+#include <random>
+#include <numeric>
+#include <functional>
 
 namespace py = pybind11;
 
@@ -413,7 +417,7 @@ public:
           num_threads_(num_threads) {}
 
     int ping() const { return 1; }
-    int version() const { return 6; }
+    int version() const { return 7; }
 
     void build(
         py::array_t<float, py::array::c_style | py::array::forcecast> centers,
@@ -452,12 +456,109 @@ public:
 
         build_center_graph();
         build_base_graph();
+        build_center_real_pool(center_real_pool_size_);
 
         center_graph_ = list_to_csr(center_adj_);
         base_graph_ = list_to_csr(base_adj_);
 
         built_ = true;
         virtuals_finalized_ = false;
+    }
+
+
+
+    void fit_auto(
+        py::array_t<float, py::array::c_style | py::array::forcecast> X,
+        const std::string& cluster_method,
+        int n_centers,
+        int cluster_max_iter,
+        float cluster_tol,
+        int random_state,
+        int train_sample_size,
+        int cpd_psd_sample,
+        int cpd_psd_exact_k,
+        int cpd_mean_sample,
+        int cpd_mean_exact_k,
+        bool finalize_virtual_nodes_flag
+    ) {
+        auto xb = X.request();
+        if (xb.ndim != 2) throw std::runtime_error("X must be 2D");
+        const int n = static_cast<int>(xb.shape[0]);
+        const int d = static_cast<int>(xb.shape[1]);
+        if (n <= 0 || d <= 0) throw std::runtime_error("X must be non-empty");
+        if (n_centers <= 0 || n_centers > n) throw std::runtime_error("invalid n_centers");
+        if (cluster_max_iter <= 0) throw std::runtime_error("cluster_max_iter must be > 0");
+        if (cluster_tol <= 0.0f) throw std::runtime_error("cluster_tol must be > 0");
+
+        const float* xptr = static_cast<const float*>(xb.ptr);
+        std::vector<float> Xfull(xptr, xptr + static_cast<size_t>(n) * d);
+
+        center_count_ = n_centers;
+        dim_ = d;
+        base_count_ = center_count_ + n;
+        built_ = false;
+        virtuals_finalized_ = false;
+        base_entry_ = -1;
+
+        std::mt19937 rng(static_cast<uint32_t>(random_state < 0 ? 42 : random_state));
+        std::vector<int> train_ids = make_train_indices(n, train_sample_size, rng);
+        std::vector<float> Xtrain = gather_rows(Xfull, train_ids, d);
+        const int n_train = static_cast<int>(train_ids.size());
+
+        std::vector<float> centers;
+        std::vector<int32_t> labels_train;
+        std::string cm = cluster_method;
+        std::transform(cm.begin(), cm.end(), cm.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (cm == "kmeans") {
+            run_kmeans(Xtrain, n_train, d, n_centers, cluster_max_iter, cluster_tol, rng, centers, labels_train);
+        } else if (cm == "cpd_kmeans") {
+            run_cpd_kmeans(
+                Xtrain,
+                n_train,
+                d,
+                n_centers,
+                cluster_max_iter,
+                cluster_tol,
+                rng,
+                cpd_psd_sample,
+                cpd_psd_exact_k,
+                cpd_mean_sample,
+                cpd_mean_exact_k,
+                centers,
+                labels_train
+            );
+        } else {
+            throw std::runtime_error("cluster_method must be 'kmeans' or 'cpd_kmeans'");
+        }
+
+        centers_ = centers;
+        build_router_from_centers();
+
+        std::vector<int32_t> labels_full;
+        assign_clusters_exact(Xfull, n, d, centers_, center_count_, labels_full);
+
+        insertion_entry_points_.assign(static_cast<size_t>(n), 0);
+        for (int i = 0; i < n; ++i) {
+            insertion_entry_points_[static_cast<size_t>(i)] = route_center_with_margin(&Xfull[static_cast<size_t>(i) * d]).center_id;
+        }
+
+        base_vectors_.clear();
+        base_vectors_.reserve(static_cast<size_t>(base_count_) * d);
+        base_vectors_.insert(base_vectors_.end(), centers_.begin(), centers_.end());
+        base_vectors_.insert(base_vectors_.end(), Xfull.begin(), Xfull.end());
+
+        build_center_anchors_from_labels(Xfull, n, d, labels_full);
+        build_center_graph();
+        build_base_graph();
+        build_center_real_pool(center_real_pool_size_);
+
+        center_graph_ = list_to_csr(center_adj_);
+        base_graph_ = list_to_csr(base_adj_);
+        built_ = true;
+
+        if (finalize_virtual_nodes_flag) {
+            finalize_virtual_nodes();
+        }
     }
 
     void set_router(
@@ -531,6 +632,7 @@ public:
 
         center_anchor_offsets_.assign(optr, optr + ob.shape[0]);
         center_anchor_indices_.assign(iptr, iptr + ib.shape[0]);
+
     }
 
     void finalize_virtual_nodes() {
@@ -539,26 +641,47 @@ public:
             return;
         }
 
+        // replacement_pool[vid]:
+        // 1) 原虚点邻域中的真实点
+        // 2) center anchors
+        // 3) 该中心最近真实点池
         std::vector<std::vector<int>> replacement_pool(static_cast<size_t>(center_count_));
+
         for (int vid = 0; vid < center_count_; ++vid) {
             std::unordered_set<int> pool;
 
+            // (1) 原虚点邻域中的真实点
             for (int nb : base_adj_[static_cast<size_t>(vid)]) {
-                if (nb >= center_count_) pool.insert(nb);
+                if (nb >= center_count_) {
+                    pool.insert(nb);
+                }
             }
 
+            // (2) center anchors
             if (!center_anchor_offsets_.empty()) {
                 int64_t start = center_anchor_offsets_[static_cast<size_t>(vid)];
                 int64_t end = center_anchor_offsets_[static_cast<size_t>(vid + 1)];
                 for (int64_t p = start; p < end; ++p) {
                     int x = center_anchor_indices_[static_cast<size_t>(p)];
-                    if (x >= center_count_) pool.insert(x);
+                    if (x >= center_count_) {
+                        pool.insert(x);
+                    }
+                }
+            }
+
+            // (3) 该中心最近真实点池
+            if (vid < static_cast<int>(center_real_pool_.size())) {
+                for (int x : center_real_pool_[static_cast<size_t>(vid)]) {
+                    if (x >= center_count_) {
+                        pool.insert(x);
+                    }
                 }
             }
 
             replacement_pool[static_cast<size_t>(vid)] = std::vector<int>(pool.begin(), pool.end());
         }
 
+        // 对每个真实点，移除指向虚点的边，并补真实边
         for (int u = center_count_; u < base_count_; ++u) {
             std::vector<int> kept;
             std::vector<int> removed_virtuals;
@@ -572,27 +695,35 @@ public:
                     continue;
                 }
                 if (nb == u) continue;
-                if (seen.insert(nb).second) kept.push_back(nb);
+                if (seen.insert(nb).second) {
+                    kept.push_back(nb);
+                }
             }
 
             if (!removed_virtuals.empty()) {
                 std::vector<int> candidates;
+                candidates.reserve(64);
                 std::unordered_set<int> cand_seen(kept.begin(), kept.end());
 
                 for (int vid : removed_virtuals) {
                     for (int x : replacement_pool[static_cast<size_t>(vid)]) {
                         if (x < center_count_ || x == u) continue;
-                        if (cand_seen.insert(x).second) candidates.push_back(x);
+                        if (cand_seen.insert(x).second) {
+                            candidates.push_back(x);
+                        }
                     }
                 }
 
                 if (!candidates.empty()) {
+                    // 先按当前点 u 到候选的距离排序
                     auto ordered = exact_sorted_ids(
                         &base_vectors_[static_cast<size_t>(u) * dim_],
                         base_vectors_,
                         dim_,
                         candidates
                     );
+
+                    // 再补到度数上限
                     for (int x : ordered) {
                         if (static_cast<int>(kept.size()) >= base_max_degree_) break;
                         kept.push_back(x);
@@ -600,6 +731,7 @@ public:
                 }
 
                 if (!kept.empty()) {
+                    // 最后再做一次 heuristic_select
                     kept = heuristic_select(
                         &base_vectors_[static_cast<size_t>(u) * dim_],
                         kept,
@@ -613,6 +745,7 @@ public:
             base_adj_[static_cast<size_t>(u)] = std::move(kept);
         }
 
+        // 虚点彻底退出 base query graph
         for (int vid = 0; vid < center_count_; ++vid) {
             base_adj_[static_cast<size_t>(vid)].clear();
         }
@@ -765,7 +898,7 @@ public:
         d["avg_center_degree"] = avg_degree(center_adj_);
         d["avg_base_degree"] = avg_degree(base_adj_);
         d["base_entry"] = base_entry_;
-        d["backend"] = "cpp-stage6";
+        d["backend"] = "cpp-stage7";
         return d;
     }
 
@@ -814,6 +947,9 @@ private:
     std::vector<int64_t> center_anchor_offsets_;
     std::vector<int32_t> center_anchor_indices_;
 
+    std::vector<std::vector<int>> center_real_pool_;
+    int center_real_pool_size_ = 32;
+
     static double avg_degree(const std::vector<std::vector<int>>& adj) {
         if (adj.empty()) return 0.0;
         double s = 0.0;
@@ -822,14 +958,533 @@ private:
     }
 
     int resolve_num_threads(int nq) const {
-    int threads = num_threads_;
-    if (threads <= 0) {
-        unsigned int hc = std::thread::hardware_concurrency();
-        threads = hc == 0 ? 1 : static_cast<int>(hc);
+        int threads = num_threads_;
+        if (threads <= 0) {
+            unsigned int hc = std::thread::hardware_concurrency();
+            threads = hc == 0 ? 1 : static_cast<int>(hc);
+        }
+        threads = std::max(1, std::min(threads, nq));
+        return threads;
     }
-    threads = std::max(1, std::min(threads, nq));
-    return threads;
-}
+    void build_center_real_pool(int pool_size) {
+        center_real_pool_.assign(static_cast<size_t>(center_count_), {});
+        if (center_count_ <= 0 || base_count_ <= center_count_ || pool_size <= 0) {
+            return;
+        }
+
+        std::vector<std::vector<CandidateDist>> buckets(static_cast<size_t>(center_count_));
+
+        // 优先用 insertion_entry_points_ 作为中心归属；如果越界，再退化到真最近中心
+        for (int rid = 0; rid < base_count_ - center_count_; ++rid) {
+            const int gid = center_count_ + rid;
+            int cid = -1;
+
+            if (rid < static_cast<int>(insertion_entry_points_.size())) {
+                cid = insertion_entry_points_[static_cast<size_t>(rid)];
+            }
+
+            if (cid < 0 || cid >= center_count_) {
+                cid = 0;
+                float best_d = l2_sq_ptr(
+                    &base_vectors_[static_cast<size_t>(gid) * dim_],
+                    &centers_[0],
+                    dim_
+                );
+                for (int j = 1; j < center_count_; ++j) {
+                    float d = l2_sq_ptr(
+                        &base_vectors_[static_cast<size_t>(gid) * dim_],
+                        &centers_[static_cast<size_t>(j) * dim_],
+                        dim_
+                    );
+                    if (d < best_d) {
+                        best_d = d;
+                        cid = j;
+                    }
+                }
+            }
+
+            float dc = l2_sq_ptr(
+                &base_vectors_[static_cast<size_t>(gid) * dim_],
+                &centers_[static_cast<size_t>(cid) * dim_],
+                dim_
+            );
+            buckets[static_cast<size_t>(cid)].push_back({gid, dc});
+        }
+
+        for (int cid = 0; cid < center_count_; ++cid) {
+            auto& bucket = buckets[static_cast<size_t>(cid)];
+            if (bucket.empty()) continue;
+
+            std::sort(bucket.begin(), bucket.end(), [](const CandidateDist& a, const CandidateDist& b) {
+                return a.dist < b.dist;
+            });
+
+            const int keep = std::min(pool_size, static_cast<int>(bucket.size()));
+            auto& out = center_real_pool_[static_cast<size_t>(cid)];
+            out.reserve(static_cast<size_t>(keep));
+            for (int i = 0; i < keep; ++i) {
+                out.push_back(bucket[static_cast<size_t>(i)].id);
+            }
+        }
+    }
+
+
+
+    std::vector<int> make_train_indices(int n, int train_sample_size, std::mt19937& rng) const {
+        std::vector<int> ids(static_cast<size_t>(n));
+        std::iota(ids.begin(), ids.end(), 0);
+        if (train_sample_size <= 0 || train_sample_size >= n) {
+            return ids;
+        }
+        std::shuffle(ids.begin(), ids.end(), rng);
+        ids.resize(static_cast<size_t>(train_sample_size));
+        return ids;
+    }
+
+    std::vector<float> gather_rows(const std::vector<float>& X, const std::vector<int>& ids, int dim) const {
+        std::vector<float> out(static_cast<size_t>(ids.size()) * dim);
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const float* src = &X[static_cast<size_t>(ids[i]) * dim];
+            std::copy(src, src + dim, out.begin() + static_cast<ptrdiff_t>(i * dim));
+        }
+        return out;
+    }
+
+    void assign_clusters_exact(
+        const std::vector<float>& X,
+        int n,
+        int dim,
+        const std::vector<float>& centers,
+        int k,
+        std::vector<int32_t>& labels
+    ) const {
+        labels.assign(static_cast<size_t>(n), 0);
+        for (int i = 0; i < n; ++i) {
+            const float* xi = &X[static_cast<size_t>(i) * dim];
+            int best = 0;
+            float best_d = l2_sq_ptr(xi, &centers[0], dim);
+            for (int j = 1; j < k; ++j) {
+                float d2 = l2_sq_ptr(xi, &centers[static_cast<size_t>(j) * dim], dim);
+                if (d2 < best_d) {
+                    best_d = d2;
+                    best = j;
+                }
+            }
+            labels[static_cast<size_t>(i)] = static_cast<int32_t>(best);
+        }
+    }
+
+    std::vector<float> init_kmeans_pp(
+        const std::vector<float>& X,
+        int n,
+        int dim,
+        int k,
+        std::mt19937& rng
+    ) const {
+        std::uniform_int_distribution<int> uid(0, n - 1);
+        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        std::vector<float> centers(static_cast<size_t>(k) * dim, 0.0f);
+        int first = uid(rng);
+        std::copy(&X[static_cast<size_t>(first) * dim], &X[static_cast<size_t>(first + 1) * dim], centers.begin());
+
+        std::vector<float> min_d2(static_cast<size_t>(n), 0.0f);
+        for (int i = 0; i < n; ++i) {
+            min_d2[static_cast<size_t>(i)] = l2_sq_ptr(&X[static_cast<size_t>(i) * dim], &centers[0], dim);
+        }
+
+        for (int c = 1; c < k; ++c) {
+            double sum = 0.0;
+            for (float v : min_d2) sum += static_cast<double>(v);
+            int idx = uid(rng);
+            if (sum > 0.0) {
+                double r = u01(rng) * sum;
+                double acc = 0.0;
+                for (int i = 0; i < n; ++i) {
+                    acc += static_cast<double>(min_d2[static_cast<size_t>(i)]);
+                    if (acc >= r) {
+                        idx = i;
+                        break;
+                    }
+                }
+            }
+            std::copy(
+                &X[static_cast<size_t>(idx) * dim],
+                &X[static_cast<size_t>(idx + 1) * dim],
+                centers.begin() + static_cast<ptrdiff_t>(c * dim)
+            );
+            for (int i = 0; i < n; ++i) {
+                float d2 = l2_sq_ptr(
+                    &X[static_cast<size_t>(i) * dim],
+                    &centers[static_cast<size_t>(c) * dim],
+                    dim
+                );
+                if (d2 < min_d2[static_cast<size_t>(i)]) {
+                    min_d2[static_cast<size_t>(i)] = d2;
+                }
+            }
+        }
+        return centers;
+    }
+
+    void recompute_centers(
+        const std::vector<float>& X,
+        int n,
+        int dim,
+        const std::vector<int32_t>& labels,
+        const std::vector<float>& weights,
+        int k,
+        std::mt19937& rng,
+        std::vector<float>& centers
+    ) const {
+        centers.assign(static_cast<size_t>(k) * dim, 0.0f);
+        std::vector<float> sumw(static_cast<size_t>(k), 0.0f);
+        for (int i = 0; i < n; ++i) {
+            int cid = labels[static_cast<size_t>(i)];
+            float w = weights.empty() ? 1.0f : weights[static_cast<size_t>(i)];
+            sumw[static_cast<size_t>(cid)] += w;
+            const float* xi = &X[static_cast<size_t>(i) * dim];
+            float* ci = &centers[static_cast<size_t>(cid) * dim];
+            for (int d0 = 0; d0 < dim; ++d0) ci[d0] += xi[d0] * w;
+        }
+        std::uniform_int_distribution<int> uid(0, n - 1);
+        for (int c = 0; c < k; ++c) {
+            float* cc = &centers[static_cast<size_t>(c) * dim];
+            if (sumw[static_cast<size_t>(c)] <= 1e-12f) {
+                int idx = uid(rng);
+                std::copy(&X[static_cast<size_t>(idx) * dim], &X[static_cast<size_t>(idx + 1) * dim], cc);
+            } else {
+                float inv = 1.0f / sumw[static_cast<size_t>(c)];
+                for (int d0 = 0; d0 < dim; ++d0) cc[d0] *= inv;
+            }
+        }
+    }
+
+    float center_shift(const std::vector<float>& a, const std::vector<float>& b) const {
+        double s = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+            s += d * d;
+        }
+        return static_cast<float>(std::sqrt(s));
+    }
+
+    std::vector<float> calculate_potential_difference(
+        const std::vector<int32_t>& labels,
+        const std::vector<float>& centers,
+        int n,
+        int dim,
+        int k,
+        std::mt19937& rng,
+        int psd_sample,
+        int psd_exact_k
+    ) const {
+        std::vector<int> cluster_sizes(static_cast<size_t>(k), 0);
+        for (int32_t x : labels) cluster_sizes[static_cast<size_t>(x)] += 1;
+        std::vector<float> psd(static_cast<size_t>(k) * dim, 0.0f);
+
+        auto accumulate_pair = [&](int i, int j) {
+            int sdiff = cluster_sizes[static_cast<size_t>(j)] - cluster_sizes[static_cast<size_t>(i)];
+            if (sdiff == 0) return;
+            float sign = sdiff < 0 ? -1.0f : 1.0f;
+            const float* ci = &centers[static_cast<size_t>(i) * dim];
+            const float* cj = &centers[static_cast<size_t>(j) * dim];
+            std::vector<float> v(static_cast<size_t>(dim), 0.0f);
+            float norm2 = 0.0f;
+            for (int d0 = 0; d0 < dim; ++d0) {
+                v[static_cast<size_t>(d0)] = (cj[d0] - ci[d0]) * sign;
+                norm2 += v[static_cast<size_t>(d0)] * v[static_cast<size_t>(d0)];
+            }
+            float norm = std::sqrt(norm2);
+            if (norm <= 1e-10f) return;
+            float w = static_cast<float>(std::abs(sdiff) / static_cast<double>(n));
+            float* pi = &psd[static_cast<size_t>(i) * dim];
+            for (int d0 = 0; d0 < dim; ++d0) {
+                pi[d0] += (v[static_cast<size_t>(d0)] / norm) * w;
+            }
+        };
+
+        if (k <= psd_exact_k || psd_sample >= k - 1) {
+            for (int i = 0; i < k; ++i) for (int j = 0; j < k; ++j) if (i != j) accumulate_pair(i, j);
+            return psd;
+        }
+
+        std::uniform_int_distribution<int> uid(0, k - 2);
+        int m = std::max(1, psd_sample);
+        for (int i = 0; i < k; ++i) {
+            for (int t = 0; t < m; ++t) {
+                int j = uid(rng);
+                if (j >= i) ++j;
+                accumulate_pair(i, j);
+            }
+            float scale = static_cast<float>((k - 1) / static_cast<double>(m));
+            float* pi = &psd[static_cast<size_t>(i) * dim];
+            for (int d0 = 0; d0 < dim; ++d0) pi[d0] *= scale;
+        }
+        return psd;
+    }
+
+    std::vector<float> calculate_weights(
+        const std::vector<float>& X,
+        int n,
+        int dim,
+        const std::vector<int32_t>& labels,
+        const std::vector<float>& centers,
+        const std::vector<float>& psd,
+        int k,
+        std::mt19937& rng,
+        int mean_sample,
+        int mean_exact_k
+    ) const {
+        std::vector<float> weight(static_cast<size_t>(n), 1.0f);
+        std::vector<float> mean_center_dist(static_cast<size_t>(k), 0.0f);
+
+        auto center_dist = [&](int i, int j) {
+            return std::sqrt(l2_sq_ptr(&centers[static_cast<size_t>(i) * dim], &centers[static_cast<size_t>(j) * dim], dim));
+        };
+
+        if (k <= mean_exact_k) {
+            for (int i = 0; i < k; ++i) {
+                float acc = 0.0f; int cnt = 0;
+                for (int j = 0; j < k; ++j) if (i != j) { acc += center_dist(i, j); ++cnt; }
+                if (cnt > 0) mean_center_dist[static_cast<size_t>(i)] = acc / cnt;
+            }
+        } else {
+            int m = std::min(std::max(1, mean_sample), std::max(1, k - 1));
+            std::uniform_int_distribution<int> uid(0, k - 2);
+            for (int i = 0; i < k; ++i) {
+                float acc = 0.0f;
+                for (int t = 0; t < m; ++t) {
+                    int j = uid(rng);
+                    if (j >= i) ++j;
+                    acc += center_dist(i, j);
+                }
+                mean_center_dist[static_cast<size_t>(i)] = acc / m;
+            }
+        }
+
+        for (int c = 0; c < k; ++c) {
+            const float* pc = &psd[static_cast<size_t>(c) * dim];
+            float psd_norm2 = 0.0f;
+            for (int d0 = 0; d0 < dim; ++d0) psd_norm2 += pc[d0] * pc[d0];
+            float psd_norm = std::sqrt(psd_norm2);
+            if (psd_norm <= 0.0f) continue;
+            float gain = 1.0f + 0.5f * std::sqrt(std::max(0.0f, mean_center_dist[static_cast<size_t>(c)])) * psd_norm;
+            const float* cc = &centers[static_cast<size_t>(c) * dim];
+            for (int i = 0; i < n; ++i) {
+                if (labels[static_cast<size_t>(i)] != c) continue;
+                const float* xi = &X[static_cast<size_t>(i) * dim];
+                float xnorm2 = 0.0f, dot = 0.0f;
+                for (int d0 = 0; d0 < dim; ++d0) {
+                    float v = xi[d0] - cc[d0];
+                    xnorm2 += v * v;
+                    dot += v * pc[d0];
+                }
+                float xnorm = std::sqrt(std::max(xnorm2, 1e-10f));
+                float cosv = dot / (xnorm * std::max(psd_norm, 1e-10f));
+                if (cosv > 0.0f) weight[static_cast<size_t>(i)] = gain;
+            }
+        }
+        return weight;
+    }
+
+    void run_kmeans(
+        const std::vector<float>& X,
+        int n,
+        int dim,
+        int k,
+        int max_iter,
+        float tol,
+        std::mt19937& rng,
+        std::vector<float>& centers,
+        std::vector<int32_t>& labels
+    ) const {
+        centers = init_kmeans_pp(X, n, dim, k, rng);
+        for (int it = 0; it < max_iter; ++it) {
+            std::vector<float> old = centers;
+            assign_clusters_exact(X, n, dim, centers, k, labels);
+            recompute_centers(X, n, dim, labels, std::vector<float>(), k, rng, centers);
+            if (center_shift(old, centers) < tol) break;
+        }
+        assign_clusters_exact(X, n, dim, centers, k, labels);
+    }
+
+    void run_cpd_kmeans(
+        const std::vector<float>& X,
+        int n,
+        int dim,
+        int k,
+        int max_iter,
+        float tol,
+        std::mt19937& rng,
+        int psd_sample,
+        int psd_exact_k,
+        int mean_sample,
+        int mean_exact_k,
+        std::vector<float>& centers,
+        std::vector<int32_t>& labels
+    ) const {
+        centers = init_kmeans_pp(X, n, dim, k, rng);
+        for (int it = 0; it < max_iter; ++it) {
+            std::vector<float> old = centers;
+            assign_clusters_exact(X, n, dim, centers, k, labels);
+            std::vector<float> psd = calculate_potential_difference(labels, centers, n, dim, k, rng, psd_sample, psd_exact_k);
+            std::vector<float> w = calculate_weights(X, n, dim, labels, centers, psd, k, rng, mean_sample, mean_exact_k);
+            recompute_centers(X, n, dim, labels, w, k, rng, centers);
+            if (center_shift(old, centers) < tol) break;
+        }
+        assign_clusters_exact(X, n, dim, centers, k, labels);
+    }
+
+    void build_router_from_centers() {
+        router_nodes_ = 0;
+        router_normals_.clear();
+        router_normal_norms_.clear();
+        router_bias_.clear();
+        router_left_.clear();
+        router_right_.clear();
+        router_leaf_center_.clear();
+        if (center_count_ <= 0) return;
+
+        std::function<int(const std::vector<int>&)> build_node = [&](const std::vector<int>& ids) -> int {
+            const int idx = static_cast<int>(router_bias_.size());
+            router_bias_.push_back(0.0f);
+            router_normal_norms_.push_back(0.0f);
+            router_left_.push_back(-1);
+            router_right_.push_back(-1);
+            router_leaf_center_.push_back(-1);
+            router_normals_.resize(static_cast<size_t>(idx + 1) * dim_, 0.0f);
+
+            if (ids.size() == 1) {
+                router_leaf_center_[static_cast<size_t>(idx)] = ids[0];
+                return idx;
+            }
+
+            std::vector<float> mean(static_cast<size_t>(dim_), 0.0f);
+            for (int id : ids) {
+                const float* c = &centers_[static_cast<size_t>(id) * dim_];
+                for (int d0 = 0; d0 < dim_; ++d0) mean[static_cast<size_t>(d0)] += c[d0];
+            }
+            float inv_n = 1.0f / static_cast<float>(ids.size());
+            for (int d0 = 0; d0 < dim_; ++d0) mean[static_cast<size_t>(d0)] *= inv_n;
+
+            int axis = 0;
+            float best_var = -1.0f;
+            for (int d0 = 0; d0 < dim_; ++d0) {
+                float var = 0.0f;
+                for (int id : ids) {
+                    float diff = centers_[static_cast<size_t>(id) * dim_ + static_cast<size_t>(d0)] - mean[static_cast<size_t>(d0)];
+                    var += diff * diff;
+                }
+                if (var > best_var) {
+                    best_var = var;
+                    axis = d0;
+                }
+            }
+
+            std::vector<std::pair<float, int>> proj;
+            proj.reserve(ids.size());
+            for (int id : ids) {
+                proj.push_back({centers_[static_cast<size_t>(id) * dim_ + static_cast<size_t>(axis)], id});
+            }
+            std::sort(proj.begin(), proj.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+            const size_t mid = proj.size() / 2;
+            std::vector<int> left_ids, right_ids;
+            left_ids.reserve(mid);
+            right_ids.reserve(proj.size() - mid);
+            for (size_t i = 0; i < proj.size(); ++i) {
+                if (i < mid) left_ids.push_back(proj[i].second); else right_ids.push_back(proj[i].second);
+            }
+            if (left_ids.empty() || right_ids.empty()) {
+                left_ids.clear(); right_ids.clear();
+                size_t half = std::max<size_t>(1, ids.size() / 2);
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    if (i < half) left_ids.push_back(ids[i]); else right_ids.push_back(ids[i]);
+                }
+            }
+
+            std::vector<float> left_mean(static_cast<size_t>(dim_), 0.0f), right_mean(static_cast<size_t>(dim_), 0.0f);
+            for (int id : left_ids) {
+                const float* c = &centers_[static_cast<size_t>(id) * dim_];
+                for (int d0 = 0; d0 < dim_; ++d0) left_mean[static_cast<size_t>(d0)] += c[d0];
+            }
+            for (int id : right_ids) {
+                const float* c = &centers_[static_cast<size_t>(id) * dim_];
+                for (int d0 = 0; d0 < dim_; ++d0) right_mean[static_cast<size_t>(d0)] += c[d0];
+            }
+            for (int d0 = 0; d0 < dim_; ++d0) {
+                left_mean[static_cast<size_t>(d0)] /= static_cast<float>(left_ids.size());
+                right_mean[static_cast<size_t>(d0)] /= static_cast<float>(right_ids.size());
+            }
+
+            std::vector<float> normal(static_cast<size_t>(dim_), 0.0f);
+            float norm2 = 0.0f;
+            for (int d0 = 0; d0 < dim_; ++d0) {
+                normal[static_cast<size_t>(d0)] = right_mean[static_cast<size_t>(d0)] - left_mean[static_cast<size_t>(d0)];
+                norm2 += normal[static_cast<size_t>(d0)] * normal[static_cast<size_t>(d0)];
+            }
+            float norm = std::sqrt(norm2);
+            float bias = 0.0f;
+            if (norm > 1e-8f) {
+                for (int d0 = 0; d0 < dim_; ++d0) {
+                    router_normals_[static_cast<size_t>(idx) * dim_ + static_cast<size_t>(d0)] = normal[static_cast<size_t>(d0)];
+                }
+                std::vector<float> midpoint(static_cast<size_t>(dim_), 0.0f);
+                for (int d0 = 0; d0 < dim_; ++d0) midpoint[static_cast<size_t>(d0)] = 0.5f * (left_mean[static_cast<size_t>(d0)] + right_mean[static_cast<size_t>(d0)]);
+                for (int d0 = 0; d0 < dim_; ++d0) bias -= normal[static_cast<size_t>(d0)] * midpoint[static_cast<size_t>(d0)];
+                router_normal_norms_[static_cast<size_t>(idx)] = norm;
+            } else {
+                router_normals_[static_cast<size_t>(idx) * dim_ + static_cast<size_t>(axis)] = 1.0f;
+                router_normal_norms_[static_cast<size_t>(idx)] = 1.0f;
+                bias = -proj[mid].first;
+            }
+            router_bias_[static_cast<size_t>(idx)] = bias;
+            router_left_[static_cast<size_t>(idx)] = build_node(left_ids);
+            router_right_[static_cast<size_t>(idx)] = build_node(right_ids);
+            return idx;
+        };
+
+        std::vector<int> ids(static_cast<size_t>(center_count_));
+        std::iota(ids.begin(), ids.end(), 0);
+        build_node(ids);
+        router_nodes_ = static_cast<int>(router_bias_.size());
+    }
+
+    void build_center_anchors_from_labels(
+        const std::vector<float>& X,
+        int n,
+        int dim,
+        const std::vector<int32_t>& labels
+    ) {
+        center_anchor_offsets_.assign(static_cast<size_t>(center_count_ + 1), 0);
+        center_anchor_indices_.clear();
+        std::vector<std::vector<int>> members(static_cast<size_t>(center_count_));
+        for (int i = 0; i < n; ++i) {
+            int cid = labels[static_cast<size_t>(i)];
+            if (cid >= 0 && cid < center_count_) members[static_cast<size_t>(cid)].push_back(i);
+        }
+        int64_t offset = 0;
+        for (int cid = 0; cid < center_count_; ++cid) {
+            const auto& mem = members[static_cast<size_t>(cid)];
+            if (!mem.empty()) {
+                std::vector<CandidateDist> dists;
+                dists.reserve(mem.size());
+                for (int idx : mem) {
+                    float d2 = l2_sq_ptr(&X[static_cast<size_t>(idx) * dim], &centers_[static_cast<size_t>(cid) * dim], dim);
+                    dists.push_back({idx + center_count_, d2});
+                }
+                int take = std::min(anchor_k_, static_cast<int>(dists.size()));
+                std::nth_element(dists.begin(), dists.begin() + take - 1, dists.end(), [](const CandidateDist& a, const CandidateDist& b) { return a.dist < b.dist; });
+                dists.resize(static_cast<size_t>(take));
+                std::sort(dists.begin(), dists.end(), [](const CandidateDist& a, const CandidateDist& b) { return a.dist < b.dist; });
+                for (const auto& x : dists) center_anchor_indices_.push_back(static_cast<int32_t>(x.id));
+                offset += take;
+            }
+            center_anchor_offsets_[static_cast<size_t>(cid + 1)] = offset;
+        }
+        anchor_offsets_len_ = static_cast<int>(center_anchor_offsets_.size());
+        anchor_indices_len_ = static_cast<int>(center_anchor_indices_.size());
+    }
 
     RouteDecision route_center_with_margin(const float* query) const {
         if (router_nodes_ == 0 || center_count_ == 0) {
@@ -1142,7 +1797,7 @@ private:
 };
 
 PYBIND11_MODULE(_tlhl_cpp, m) {
-    m.doc() = "TLHL C++ core stage 5";
+    m.doc() = "TLHL C++ core stage 7";
 
     py::class_<TLHLCore>(m, "TLHLCore")
         .def(
@@ -1167,6 +1822,19 @@ PYBIND11_MODULE(_tlhl_cpp, m) {
         )
         .def("ping", &TLHLCore::ping)
         .def("version", &TLHLCore::version)
+        .def("fit_auto", &TLHLCore::fit_auto,
+             py::arg("X"),
+             py::arg("cluster_method"),
+             py::arg("n_centers"),
+             py::arg("cluster_max_iter") = 20,
+             py::arg("cluster_tol") = 1e-6f,
+             py::arg("random_state") = 42,
+             py::arg("train_sample_size") = -1,
+             py::arg("cpd_psd_sample") = 64,
+             py::arg("cpd_psd_exact_k") = 512,
+             py::arg("cpd_mean_sample") = 64,
+             py::arg("cpd_mean_exact_k") = 512,
+             py::arg("finalize_virtual_nodes") = true)
         .def("build", &TLHLCore::build,
              py::arg("centers"),
              py::arg("base_vectors"),
