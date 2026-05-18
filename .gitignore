@@ -123,5 +123,5 @@ two_layer_hnsw_like/.idea
 two_layer_hnsw_like/__pycache__
 two_layer_hnsw_like_cpp.egg-info/
 pybind11/
-two_layer_hnsw_like/old/
+two_layer_hnsw_like_cpp/old/
 src/old/
