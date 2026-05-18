@@ -46,12 +46,6 @@ class IndexParams:
     cross_partition_out_degree_per_part: int = 2
     cross_partition_radius_mul: float = 1.25
 
-    rabitq_enabled: bool = True
-    rabitq_bits: int = 64
-    rabitq_center_keep: int = 16
-    rabitq_pool_keep: int = 24
-    rabitq_min_scan: int = 24
-
     def __post_init__(self) -> None:
         if self.n_centers <= 0:
             raise ValueError("n_centers must be > 0")
@@ -107,11 +101,6 @@ class TwoLayerHNSWLikeIndexCPP:
         cross_partition_search_ef: int = 32,
         cross_partition_out_degree_per_part: int = 2,
         cross_partition_radius_mul: float = 1.25,
-        rabitq_enabled: bool = True,
-        rabitq_bits: int = 64,
-        rabitq_center_keep: int = 16,
-        rabitq_pool_keep: int = 24,
-        rabitq_min_scan: int = 24,
     ) -> None:
         self.params = IndexParams(
             n_centers=n_centers,
@@ -146,11 +135,6 @@ class TwoLayerHNSWLikeIndexCPP:
             cross_partition_search_ef=cross_partition_search_ef,
             cross_partition_out_degree_per_part=cross_partition_out_degree_per_part,
             cross_partition_radius_mul=cross_partition_radius_mul,
-            rabitq_enabled=rabitq_enabled,
-            rabitq_bits=rabitq_bits,
-            rabitq_center_keep=rabitq_center_keep,
-            rabitq_pool_keep=rabitq_pool_keep,
-            rabitq_min_scan=rabitq_min_scan,
         )
         self.core = TLHLCore(
             self.params.m,
@@ -177,14 +161,6 @@ class TwoLayerHNSWLikeIndexCPP:
                 int(self.params.cross_partition_search_ef),
                 int(self.params.cross_partition_out_degree_per_part),
                 float(self.params.cross_partition_radius_mul),
-            )
-        if hasattr(self.core, "set_rabitq"):
-            self.core.set_rabitq(
-                bool(self.params.rabitq_enabled),
-                int(self.params.rabitq_bits),
-                int(self.params.rabitq_center_keep),
-                int(self.params.rabitq_pool_keep),
-                int(self.params.rabitq_min_scan),
             )
 
     def fit(self, X: np.ndarray) -> "TwoLayerHNSWLikeIndexCPP":

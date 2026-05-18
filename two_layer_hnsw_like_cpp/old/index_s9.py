@@ -38,20 +38,6 @@ class IndexParams:
     num_threads: int = 0
     finalize_virtual_nodes: bool = True
 
-    cross_partition_locality: bool = True
-    cross_partition_top_centers: int = 3
-    cross_partition_extra_partitions: int = 2
-    cross_partition_local_topk: int = 2
-    cross_partition_search_ef: int = 32
-    cross_partition_out_degree_per_part: int = 2
-    cross_partition_radius_mul: float = 1.25
-
-    rabitq_enabled: bool = True
-    rabitq_bits: int = 64
-    rabitq_center_keep: int = 16
-    rabitq_pool_keep: int = 24
-    rabitq_min_scan: int = 24
-
     def __post_init__(self) -> None:
         if self.n_centers <= 0:
             raise ValueError("n_centers must be > 0")
@@ -100,18 +86,6 @@ class TwoLayerHNSWLikeIndexCPP:
         route_margin_high: float = 0.20,
         num_threads: int = 0,
         finalize_virtual_nodes: bool = True,
-        cross_partition_locality: bool = True,
-        cross_partition_top_centers: int = 3,
-        cross_partition_extra_partitions: int = 2,
-        cross_partition_local_topk: int = 2,
-        cross_partition_search_ef: int = 32,
-        cross_partition_out_degree_per_part: int = 2,
-        cross_partition_radius_mul: float = 1.25,
-        rabitq_enabled: bool = True,
-        rabitq_bits: int = 64,
-        rabitq_center_keep: int = 16,
-        rabitq_pool_keep: int = 24,
-        rabitq_min_scan: int = 24,
     ) -> None:
         self.params = IndexParams(
             n_centers=n_centers,
@@ -139,18 +113,6 @@ class TwoLayerHNSWLikeIndexCPP:
             route_margin_high=route_margin_high,
             num_threads=num_threads,
             finalize_virtual_nodes=finalize_virtual_nodes,
-            cross_partition_locality=cross_partition_locality,
-            cross_partition_top_centers=cross_partition_top_centers,
-            cross_partition_extra_partitions=cross_partition_extra_partitions,
-            cross_partition_local_topk=cross_partition_local_topk,
-            cross_partition_search_ef=cross_partition_search_ef,
-            cross_partition_out_degree_per_part=cross_partition_out_degree_per_part,
-            cross_partition_radius_mul=cross_partition_radius_mul,
-            rabitq_enabled=rabitq_enabled,
-            rabitq_bits=rabitq_bits,
-            rabitq_center_keep=rabitq_center_keep,
-            rabitq_pool_keep=rabitq_pool_keep,
-            rabitq_min_scan=rabitq_min_scan,
         )
         self.core = TLHLCore(
             self.params.m,
@@ -168,24 +130,6 @@ class TwoLayerHNSWLikeIndexCPP:
             bool(self.params.adaptive_ef_extra),
             int(self.params.num_threads),
         )
-        if hasattr(self.core, "set_cross_partition_locality"):
-            self.core.set_cross_partition_locality(
-                bool(self.params.cross_partition_locality),
-                int(self.params.cross_partition_top_centers),
-                int(self.params.cross_partition_extra_partitions),
-                int(self.params.cross_partition_local_topk),
-                int(self.params.cross_partition_search_ef),
-                int(self.params.cross_partition_out_degree_per_part),
-                float(self.params.cross_partition_radius_mul),
-            )
-        if hasattr(self.core, "set_rabitq"):
-            self.core.set_rabitq(
-                bool(self.params.rabitq_enabled),
-                int(self.params.rabitq_bits),
-                int(self.params.rabitq_center_keep),
-                int(self.params.rabitq_pool_keep),
-                int(self.params.rabitq_min_scan),
-            )
 
     def fit(self, X: np.ndarray) -> "TwoLayerHNSWLikeIndexCPP":
         X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))

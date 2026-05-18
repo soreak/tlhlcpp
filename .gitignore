@@ -112,6 +112,7 @@ two_layer_hnsw_like/data/**
 gt_top100_faiss.py
 test_accuracy.py
 test_recall_tlhl_cpp.py
+sift_top10000_rings.py
 sift-128-euclidean.hdf5
 
 #git config 
@@ -122,3 +123,5 @@ two_layer_hnsw_like/.idea
 two_layer_hnsw_like/__pycache__
 two_layer_hnsw_like_cpp.egg-info/
 pybind11/
+two_layer_hnsw_like/old/
+src/old/

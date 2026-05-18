@@ -14,26 +14,131 @@
 #include <vector>
 #include <thread>
 #include <string>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include <random>
 #include <numeric>
 #include <functional>
+#include <chrono>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace py = pybind11;
 
 namespace {
 
+using SteadyClock = std::chrono::steady_clock;
+inline double now_ms_clock() { return std::chrono::duration<double, std::milli>(SteadyClock::now().time_since_epoch()).count(); }
+
 inline float l2_sq_ptr(const float* a, const float* b, int dim) {
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        __m256 diff = _mm256_sub_ps(va, vb);
+    #if defined(__FMA__)
+        acc = _mm256_fmadd_ps(diff, diff, acc);
+    #else
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+    #endif
+    }
+    alignas(32) float tmp[8];
+    _mm256_store_ps(tmp, acc);
+    float s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+    for (; i < dim; ++i) {
+        const float d = a[i] - b[i];
+        s += d * d;
+    }
+    return s;
+#else
     float s = 0.0f;
     for (int i = 0; i < dim; ++i) {
         const float d = a[i] - b[i];
         s += d * d;
     }
     return s;
+#endif
+}
+
+inline float dot_ptr(const float* a, const float* b, int dim) {
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+    #if defined(__FMA__)
+        acc = _mm256_fmadd_ps(va, vb, acc);
+    #else
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(va, vb));
+    #endif
+    }
+    alignas(32) float tmp[8];
+    _mm256_store_ps(tmp, acc);
+    float s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+    for (; i < dim; ++i) {
+        s += a[i] * b[i];
+    }
+    return s;
+#else
+    float s = 0.0f;
+    for (int i = 0; i < dim; ++i) {
+        s += a[i] * b[i];
+    }
+    return s;
+#endif
+}
+
+inline float sq_norm_ptr(const float* a, int dim) {
+    return dot_ptr(a, a, dim);
+}
+
+inline float l2_sq_query_to_vec_normed(
+    const float* query,
+    float query_sq_norm,
+    const float* vec,
+    float vec_sq_norm,
+    int dim
+) {
+    float d = query_sq_norm + vec_sq_norm - 2.0f * dot_ptr(query, vec, dim);
+    return d > 0.0f ? d : 0.0f;
+}
+
+inline std::vector<float> compute_sq_norms_flat(const std::vector<float>& flat, int count, int dim) {
+    std::vector<float> norms(static_cast<size_t>(std::max(0, count)), 0.0f);
+    for (int i = 0; i < count; ++i) {
+        norms[static_cast<size_t>(i)] = sq_norm_ptr(&flat[static_cast<size_t>(i) * dim], dim);
+    }
+    return norms;
+}
+
+
+inline int popcount_u64(uint64_t x) {
+#if defined(_MSC_VER)
+    return static_cast<int>(__popcnt64(x));
+#else
+    return __builtin_popcountll(x);
+#endif
+}
+
+inline void l2_normalize_inplace(std::vector<float>& v) {
+    const float n = std::sqrt(std::max(1e-12f, sq_norm_ptr(v.data(), static_cast<int>(v.size()))));
+    for (float& x : v) x /= n;
 }
 
 struct CandidateDist {
     int id;
     float dist;
+};
+
+
+struct RabitqScoredId {
+    int id;
+    int ham;
 };
 
 struct MinCand {
@@ -59,13 +164,24 @@ struct CSRGraph {
 
 struct SearchWorkspace {
     std::vector<int> visited;
+    std::vector<int> scratch_ids_a;
+    std::vector<CandidateDist> scratch_real;
     int visit_token = 1;
 
-    explicit SearchWorkspace(int n = 0) : visited(static_cast<size_t>(std::max(1, n)), 0) {}
+    explicit SearchWorkspace(int n = 0) : visited(static_cast<size_t>(std::max(1, n)), 0) {
+        reserve(std::max(1, n));
+    }
+
+    void reserve(int n) {
+        const size_t cap = static_cast<size_t>(std::max(16, n));
+        scratch_ids_a.reserve(cap);
+        scratch_real.reserve(cap);
+    }
 
     void resize(int n) {
         visited.assign(static_cast<size_t>(std::max(1, n)), 0);
         visit_token = 1;
+        reserve(n);
     }
 
     void next_token() {
@@ -82,6 +198,94 @@ struct RouteDecision {
     float margin = std::numeric_limits<float>::infinity();
 };
 
+struct LayerTraceStats {
+    int64_t entry_points = 0;
+    int64_t seed_pushes = 0;
+    int64_t heap_pushes = 0;
+    int64_t heap_pops = 0;
+    int64_t visited_nodes = 0;
+    int64_t node_expansions = 0;
+    int64_t edges_scanned = 0;
+    int64_t distance_evals = 0;
+    int64_t early_breaks = 0;
+    int64_t result_count = 0;
+};
+
+struct QueryTraceStats {
+    int64_t requested_probe_count = 0;
+    int64_t probe_count = 0;
+    int64_t center_probe_ef = 0;
+    int64_t ef = 0;
+    int64_t ef_internal = 0;
+    int64_t entry_points_raw = 0;
+    int64_t entry_points_before_cap = 0;
+    int64_t entry_points_after_cap = 0;
+    int64_t direct_real_entries = 0;
+    int64_t anchor_entries = 0;
+    int64_t fallback_entries = 0;
+    int64_t center_candidates = 0;
+    int64_t final_candidates = 0;
+    int64_t final_real_candidates = 0;
+    int64_t topk = 0;
+    int64_t used_query_graph = 0;
+    int64_t route_center_id = 0;
+    float route_margin = 0.0f;
+    int64_t bridge_edges_traversed = 0;
+    int64_t bridge_targets_visited = 0;
+    int64_t bridge_used = 0;
+    double total_ms = 0.0;
+    double route_ms = 0.0;
+    double entry_select_ms = 0.0;
+    double center_search_ms = 0.0;
+    double base_search_ms = 0.0;
+    double final_rerank_ms = 0.0;
+    double distance_ms = 0.0;
+    double jump_ms = 0.0;
+    LayerTraceStats center_layer;
+    LayerTraceStats base_layer;
+};
+
+struct BatchTraceStats {
+    int64_t queries = 0;
+    int64_t requested_probe_count_sum = 0;
+    int64_t probe_count_sum = 0;
+    int64_t center_probe_ef_sum = 0;
+    int64_t ef_sum = 0;
+    int64_t ef_internal_sum = 0;
+    int64_t entry_points_raw_sum = 0;
+    int64_t entry_points_before_cap_sum = 0;
+    int64_t entry_points_after_cap_sum = 0;
+    int64_t direct_real_entries_sum = 0;
+    int64_t anchor_entries_sum = 0;
+    int64_t fallback_entries_sum = 0;
+    int64_t center_candidates_sum = 0;
+    int64_t final_candidates_sum = 0;
+    int64_t final_real_candidates_sum = 0;
+    int64_t topk_sum = 0;
+    int64_t used_query_graph_sum = 0;
+    float route_margin_sum = 0.0f;
+    int64_t route_margin_count = 0;
+    int64_t bridge_edges_traversed_sum = 0;
+    int64_t bridge_targets_visited_sum = 0;
+    int64_t bridge_used_sum = 0;
+    int64_t bridge_edges_traversed_max = 0;
+    int64_t entry_points_after_cap_max = 0;
+    int64_t probe_count_max = 0;
+    double total_ms_sum = 0.0;
+    double route_ms_sum = 0.0;
+    double entry_select_ms_sum = 0.0;
+    double center_search_ms_sum = 0.0;
+    double base_search_ms_sum = 0.0;
+    double final_rerank_ms_sum = 0.0;
+    double distance_ms_sum = 0.0;
+    double jump_ms_sum = 0.0;
+    double total_ms_max = 0.0;
+    double distance_ms_max = 0.0;
+    double jump_ms_max = 0.0;
+    LayerTraceStats center_layer_sum;
+    LayerTraceStats base_layer_sum;
+};
+
 std::vector<int> unique_keep_order(const std::vector<int>& in) {
     std::unordered_set<int> seen;
     std::vector<int> out;
@@ -96,12 +300,18 @@ std::vector<int> exact_sorted_ids(
     const float* query,
     const std::vector<float>& vectors,
     int dim,
-    const std::vector<int>& ids
+    const std::vector<int>& ids,
+    const std::vector<float>* vec_sq_norms = nullptr,
+    float query_sq_norm = -1.0f
 ) {
+    if (query_sq_norm < 0.0f) query_sq_norm = sq_norm_ptr(query, dim);
     std::vector<CandidateDist> items;
     items.reserve(ids.size());
     for (int id : ids) {
-        items.push_back({id, l2_sq_ptr(query, &vectors[static_cast<size_t>(id) * dim], dim)});
+        float d = vec_sq_norms
+            ? l2_sq_query_to_vec_normed(query, query_sq_norm, &vectors[static_cast<size_t>(id) * dim], (*vec_sq_norms)[static_cast<size_t>(id)], dim)
+            : l2_sq_ptr(query, &vectors[static_cast<size_t>(id) * dim], dim);
+        items.push_back({id, d});
     }
     std::sort(items.begin(), items.end(), [](const CandidateDist& a, const CandidateDist& b) {
         return a.dist < b.dist;
@@ -220,15 +430,25 @@ std::vector<int> search_layer_list(
     const float* query,
     const std::vector<int>& entry_points,
     const std::vector<float>& vectors,
+    const std::vector<float>* vec_sq_norms,
+    float query_sq_norm,
     int n_nodes,
     int dim,
     const std::vector<std::vector<int>>& adj,
     int ef,
-    SearchWorkspace& ws
+    SearchWorkspace& ws,
+    LayerTraceStats* stats = nullptr,
+    double* distance_ms = nullptr,
+    double* jump_ms = nullptr
 ) {
     if (n_nodes <= 0) return {};
     ef = std::max(1, std::min(ef, n_nodes));
+    const double layer_t0_ms = now_ms_clock();
+    double layer_distance_ms = 0.0;
     ws.next_token();
+    if (stats) {
+        stats->entry_points = static_cast<int64_t>(entry_points.size());
+    }
 
     std::priority_queue<MinCand, std::vector<MinCand>, std::greater<MinCand>> candidate_heap;
     std::priority_queue<MaxBest> top_heap;
@@ -237,34 +457,67 @@ std::vector<int> search_layer_list(
         if (ep < 0 || ep >= n_nodes) continue;
         if (ws.visited[static_cast<size_t>(ep)] == ws.visit_token) continue;
         ws.visited[static_cast<size_t>(ep)] = ws.visit_token;
-        float d = l2_sq_ptr(query, &vectors[static_cast<size_t>(ep) * dim], dim);
+        const double dist_t0_ms = now_ms_clock();
+        float d = vec_sq_norms
+            ? l2_sq_query_to_vec_normed(query, query_sq_norm, &vectors[static_cast<size_t>(ep) * dim], (*vec_sq_norms)[static_cast<size_t>(ep)], dim)
+            : l2_sq_ptr(query, &vectors[static_cast<size_t>(ep) * dim], dim);
+        layer_distance_ms += (now_ms_clock() - dist_t0_ms);
         candidate_heap.push({d, ep});
         top_heap.push({d, ep});
+        if (stats) {
+            stats->seed_pushes += 1;
+            stats->heap_pushes += 1;
+            stats->visited_nodes += 1;
+            stats->distance_evals += 1;
+        }
     }
     if (candidate_heap.empty()) {
         int ep = 0;
-        float d = l2_sq_ptr(query, &vectors[0], dim);
+        const double dist_t0_ms = now_ms_clock();
+        float d = vec_sq_norms
+            ? l2_sq_query_to_vec_normed(query, query_sq_norm, &vectors[0], (*vec_sq_norms)[0], dim)
+            : l2_sq_ptr(query, &vectors[0], dim);
+        layer_distance_ms += (now_ms_clock() - dist_t0_ms);
         candidate_heap.push({d, ep});
         top_heap.push({d, ep});
         ws.visited[0] = ws.visit_token;
+        if (stats) {
+            stats->seed_pushes += 1;
+            stats->heap_pushes += 1;
+            stats->visited_nodes += 1;
+            stats->distance_evals += 1;
+        }
     }
 
     while (!candidate_heap.empty()) {
         auto curr = candidate_heap.top();
         candidate_heap.pop();
+        if (stats) stats->heap_pops += 1;
 
         float worst_best = top_heap.top().dist;
         if (curr.dist > worst_best && static_cast<int>(top_heap.size()) >= ef) {
+            if (stats) stats->early_breaks += 1;
             break;
         }
+        if (stats) stats->node_expansions += 1;
 
         for (int nb : adj[static_cast<size_t>(curr.id)]) {
+            if (stats) stats->edges_scanned += 1;
             if (ws.visited[static_cast<size_t>(nb)] == ws.visit_token) continue;
             ws.visited[static_cast<size_t>(nb)] = ws.visit_token;
-            float d = l2_sq_ptr(query, &vectors[static_cast<size_t>(nb) * dim], dim);
+            const double dist_t0_ms = now_ms_clock();
+            float d = vec_sq_norms
+                ? l2_sq_query_to_vec_normed(query, query_sq_norm, &vectors[static_cast<size_t>(nb) * dim], (*vec_sq_norms)[static_cast<size_t>(nb)], dim)
+                : l2_sq_ptr(query, &vectors[static_cast<size_t>(nb) * dim], dim);
+            layer_distance_ms += (now_ms_clock() - dist_t0_ms);
+            if (stats) {
+                stats->visited_nodes += 1;
+                stats->distance_evals += 1;
+            }
             if (static_cast<int>(top_heap.size()) < ef || d < worst_best) {
                 candidate_heap.push({d, nb});
                 top_heap.push({d, nb});
+                if (stats) stats->heap_pushes += 1;
                 if (static_cast<int>(top_heap.size()) > ef) {
                     top_heap.pop();
                 }
@@ -285,6 +538,10 @@ std::vector<int> search_layer_list(
     std::vector<int> out;
     out.reserve(tmp.size());
     for (const auto& x : tmp) out.push_back(x.id);
+    if (stats) stats->result_count = static_cast<int64_t>(out.size());
+    const double layer_total_ms = now_ms_clock() - layer_t0_ms;
+    if (distance_ms) *distance_ms += layer_distance_ms;
+    if (jump_ms) *jump_ms += std::max(0.0, layer_total_ms - layer_distance_ms);
     return out;
 }
 
@@ -292,15 +549,28 @@ std::vector<int> search_layer_csr(
     const float* query,
     const std::vector<int>& entry_points,
     const std::vector<float>& vectors,
+    const std::vector<float>* vec_sq_norms,
+    float query_sq_norm,
     int n_nodes,
     int dim,
     const CSRGraph& graph,
     int ef,
-    SearchWorkspace& ws
+    SearchWorkspace& ws,
+    LayerTraceStats* stats = nullptr,
+    const std::vector<std::vector<int>>* bridge_out = nullptr,
+    int64_t* bridge_edges_traversed = nullptr,
+    int64_t* bridge_targets_visited = nullptr,
+    double* distance_ms = nullptr,
+    double* jump_ms = nullptr
 ) {
     if (n_nodes <= 0) return {};
     ef = std::max(1, std::min(ef, n_nodes));
+    const double layer_t0_ms = now_ms_clock();
+    double layer_distance_ms = 0.0;
     ws.next_token();
+    if (stats) {
+        stats->entry_points = static_cast<int64_t>(entry_points.size());
+    }
 
     std::priority_queue<MinCand, std::vector<MinCand>, std::greater<MinCand>> candidate_heap;
     std::priority_queue<MaxBest> top_heap;
@@ -309,37 +579,83 @@ std::vector<int> search_layer_csr(
         if (ep < 0 || ep >= n_nodes) continue;
         if (ws.visited[static_cast<size_t>(ep)] == ws.visit_token) continue;
         ws.visited[static_cast<size_t>(ep)] = ws.visit_token;
-        float d = l2_sq_ptr(query, &vectors[static_cast<size_t>(ep) * dim], dim);
+        const double dist_t0_ms = now_ms_clock();
+        float d = vec_sq_norms
+            ? l2_sq_query_to_vec_normed(query, query_sq_norm, &vectors[static_cast<size_t>(ep) * dim], (*vec_sq_norms)[static_cast<size_t>(ep)], dim)
+            : l2_sq_ptr(query, &vectors[static_cast<size_t>(ep) * dim], dim);
+        layer_distance_ms += (now_ms_clock() - dist_t0_ms);
         candidate_heap.push({d, ep});
         top_heap.push({d, ep});
+        if (stats) {
+            stats->seed_pushes += 1;
+            stats->heap_pushes += 1;
+            stats->visited_nodes += 1;
+            stats->distance_evals += 1;
+        }
     }
     if (candidate_heap.empty()) {
         int ep = 0;
-        float d = l2_sq_ptr(query, &vectors[0], dim);
+        const double dist_t0_ms = now_ms_clock();
+        float d = vec_sq_norms
+            ? l2_sq_query_to_vec_normed(query, query_sq_norm, &vectors[0], (*vec_sq_norms)[0], dim)
+            : l2_sq_ptr(query, &vectors[0], dim);
+        layer_distance_ms += (now_ms_clock() - dist_t0_ms);
         candidate_heap.push({d, ep});
         top_heap.push({d, ep});
         ws.visited[0] = ws.visit_token;
+        if (stats) {
+            stats->seed_pushes += 1;
+            stats->heap_pushes += 1;
+            stats->visited_nodes += 1;
+            stats->distance_evals += 1;
+        }
     }
 
     while (!candidate_heap.empty()) {
         auto curr = candidate_heap.top();
         candidate_heap.pop();
+        if (stats) stats->heap_pops += 1;
 
         float worst_best = top_heap.top().dist;
         if (curr.dist > worst_best && static_cast<int>(top_heap.size()) >= ef) {
+            if (stats) stats->early_breaks += 1;
             break;
         }
+        if (stats) stats->node_expansions += 1;
 
         const int64_t start = graph.offsets[static_cast<size_t>(curr.id)];
         const int64_t end = graph.offsets[static_cast<size_t>(curr.id + 1)];
         for (int64_t p = start; p < end; ++p) {
             int nb = graph.indices[static_cast<size_t>(p)];
+            if (stats) stats->edges_scanned += 1;
+
+            bool is_bridge_edge = false;
+            if (bridge_out != nullptr && curr.id >= 0 && curr.id < static_cast<int>(bridge_out->size())) {
+                const auto& rowb = (*bridge_out)[static_cast<size_t>(curr.id)];
+                is_bridge_edge = std::find(rowb.begin(), rowb.end(), nb) != rowb.end();
+                if (is_bridge_edge && bridge_edges_traversed) {
+                    *bridge_edges_traversed += 1;
+                }
+            }
+
             if (ws.visited[static_cast<size_t>(nb)] == ws.visit_token) continue;
             ws.visited[static_cast<size_t>(nb)] = ws.visit_token;
-            float d = l2_sq_ptr(query, &vectors[static_cast<size_t>(nb) * dim], dim);
+            if (is_bridge_edge && bridge_targets_visited) {
+                *bridge_targets_visited += 1;
+            }
+            const double dist_t0_ms = now_ms_clock();
+            float d = vec_sq_norms
+                ? l2_sq_query_to_vec_normed(query, query_sq_norm, &vectors[static_cast<size_t>(nb) * dim], (*vec_sq_norms)[static_cast<size_t>(nb)], dim)
+                : l2_sq_ptr(query, &vectors[static_cast<size_t>(nb) * dim], dim);
+            layer_distance_ms += (now_ms_clock() - dist_t0_ms);
+            if (stats) {
+                stats->visited_nodes += 1;
+                stats->distance_evals += 1;
+            }
             if (static_cast<int>(top_heap.size()) < ef || d < worst_best) {
                 candidate_heap.push({d, nb});
                 top_heap.push({d, nb});
+                if (stats) stats->heap_pushes += 1;
                 if (static_cast<int>(top_heap.size()) > ef) {
                     top_heap.pop();
                 }
@@ -360,8 +676,13 @@ std::vector<int> search_layer_csr(
     std::vector<int> out;
     out.reserve(tmp.size());
     for (const auto& x : tmp) out.push_back(x.id);
+    if (stats) stats->result_count = static_cast<int64_t>(out.size());
+    const double layer_total_ms = now_ms_clock() - layer_t0_ms;
+    if (distance_ms) *distance_ms += layer_distance_ms;
+    if (jump_ms) *jump_ms += std::max(0.0, layer_total_ms - layer_distance_ms);
     return out;
 }
+
 
 CSRGraph list_to_csr(const std::vector<std::vector<int>>& adj) {
     CSRGraph graph;
@@ -417,7 +738,7 @@ public:
           num_threads_(num_threads) {}
 
     int ping() const { return 1; }
-    int version() const { return 7; }
+    int version() const { return 16; }
 
     void build(
         py::array_t<float, py::array::c_style | py::array::forcecast> centers,
@@ -451,16 +772,30 @@ public:
         const int32_t* iptr = static_cast<const int32_t*>(ib.ptr);
 
         centers_.assign(cptr, cptr + static_cast<std::size_t>(center_count_) * dim_);
+        centers_sq_norms_ = compute_sq_norms_flat(centers_, center_count_, dim_);
         base_vectors_.assign(bptr, bptr + static_cast<std::size_t>(base_count_) * dim_);
+        base_sq_norms_ = compute_sq_norms_flat(base_vectors_, base_count_, dim_);
         insertion_entry_points_.assign(iptr, iptr + ib.shape[0]);
+        cross_partition_bridge_out_.assign(static_cast<size_t>(base_count_), {});
+        cross_partition_nodes_processed_ = 0;
+        cross_partition_ambiguous_points_ = 0;
+        cross_partition_partition_searches_ = 0;
+        cross_partition_bidirectional_edges_added_ = 0;
+        cross_partition_out_edges_added_ = 0;
+        cross_partition_total_edges_added_ = 0;
+        cross_partition_edges_survived_in_query_graph_ = 0;
 
         build_center_graph();
         build_base_graph();
         build_center_real_pool(center_real_pool_size_);
+        augment_cross_partition_locality();
+        build_query_graph_from_base();
 
         center_graph_ = list_to_csr(center_adj_);
         base_graph_ = list_to_csr(base_adj_);
+        query_graph_ = list_to_csr(query_adj_);
 
+        rebuild_rabitq_codes();
         built_ = true;
         virtuals_finalized_ = false;
     }
@@ -497,6 +832,14 @@ public:
         dim_ = d;
         base_count_ = center_count_ + n;
         built_ = false;
+        cross_partition_bridge_out_.assign(static_cast<size_t>(base_count_), {});
+        cross_partition_nodes_processed_ = 0;
+        cross_partition_ambiguous_points_ = 0;
+        cross_partition_partition_searches_ = 0;
+        cross_partition_bidirectional_edges_added_ = 0;
+        cross_partition_out_edges_added_ = 0;
+        cross_partition_total_edges_added_ = 0;
+        cross_partition_edges_survived_in_query_graph_ = 0;
         virtuals_finalized_ = false;
         base_entry_ = -1;
 
@@ -532,6 +875,7 @@ public:
         }
 
         centers_ = centers;
+        centers_sq_norms_ = compute_sq_norms_flat(centers_, center_count_, dim_);
         build_router_from_centers();
 
         std::vector<int32_t> labels_full;
@@ -546,18 +890,32 @@ public:
         base_vectors_.reserve(static_cast<size_t>(base_count_) * d);
         base_vectors_.insert(base_vectors_.end(), centers_.begin(), centers_.end());
         base_vectors_.insert(base_vectors_.end(), Xfull.begin(), Xfull.end());
+        base_sq_norms_ = compute_sq_norms_flat(base_vectors_, base_count_, dim_);
 
         build_center_anchors_from_labels(Xfull, n, d, labels_full);
         build_center_graph();
         build_base_graph();
         build_center_real_pool(center_real_pool_size_);
+        if (finalize_virtual_nodes_flag) {
+            // postpone cross-partition augmentation until virtual nodes are finalized
+        } else {
+            augment_cross_partition_locality();
+        }
+        build_query_graph_from_base();
 
         center_graph_ = list_to_csr(center_adj_);
         base_graph_ = list_to_csr(base_adj_);
+        query_graph_ = list_to_csr(query_adj_);
         built_ = true;
 
         if (finalize_virtual_nodes_flag) {
             finalize_virtual_nodes();
+            cross_partition_bridge_out_.assign(static_cast<size_t>(base_count_), {});
+            cross_partition_edges_survived_in_query_graph_ = 0;
+            augment_cross_partition_locality();
+            build_query_graph_from_base();
+            base_graph_ = list_to_csr(base_adj_);
+            query_graph_ = list_to_csr(query_adj_);
         }
     }
 
@@ -751,6 +1109,8 @@ public:
         }
 
         base_graph_ = list_to_csr(base_adj_);
+        build_query_graph_from_base();
+        query_graph_ = list_to_csr(query_adj_);
         virtuals_finalized_ = true;
     }
 
@@ -771,7 +1131,11 @@ public:
 
         SearchWorkspace center_ws(std::max(1, center_count_));
         SearchWorkspace base_ws(std::max(1, base_count_));
-        auto result = search_impl(qptr, k, ef, n_probe_centers, center_ws, base_ws);
+        QueryTraceStats trace;
+        auto result = search_impl(qptr, k, ef, n_probe_centers, center_ws, base_ws, &trace);
+        last_query_stats_ = trace;
+        last_query_stats_valid_ = true;
+        last_batch_stats_valid_ = false;
 
         py::array_t<int32_t> ids(static_cast<py::ssize_t>(result.first.size()));
         py::array_t<float> dists(static_cast<py::ssize_t>(result.second.size()));
@@ -811,19 +1175,22 @@ public:
         int32_t* ids_ptr = static_cast<int32_t*>(ib.ptr);
         float* dists_ptr = static_cast<float*>(db.ptr);
 
-        auto worker = [&](int begin, int end) {
+        auto worker = [&](int begin, int end, BatchTraceStats* out_stats) {
             SearchWorkspace center_ws(std::max(1, center_count_));
             SearchWorkspace base_ws(std::max(1, base_count_));
 
             for (int i = begin; i < end; ++i) {
+                QueryTraceStats trace;
                 auto one = search_impl(
                     qptr + static_cast<size_t>(i) * dim_,
                     k,
                     ef,
                     n_probe_centers,
                     center_ws,
-                    base_ws
+                    base_ws,
+                    &trace
                 );
+                if (out_stats) accumulate_batch_stats(*out_stats, trace);
 
                 int32_t* row_ids = ids_ptr + static_cast<size_t>(i) * k;
                 float* row_dists = dists_ptr + static_cast<size_t>(i) * k;
@@ -846,28 +1213,134 @@ public:
             py::gil_scoped_release release;
 
             if (threads <= 1) {
-                worker(0, nq);
+                BatchTraceStats agg;
+                worker(0, nq, &agg);
+                last_batch_stats_ = agg;
             } else {
                 std::vector<std::thread> pool;
                 pool.reserve(static_cast<size_t>(threads));
+                std::vector<BatchTraceStats> aggs(static_cast<size_t>(threads));
 
                 const int chunk = (nq + threads - 1) / threads;
                 for (int t = 0; t < threads; ++t) {
                     const int begin = t * chunk;
                     const int end = std::min(nq, begin + chunk);
                     if (begin >= end) break;
-                    pool.emplace_back(worker, begin, end);
+                    pool.emplace_back(worker, begin, end, &aggs[static_cast<size_t>(t)]);
                 }
 
                 for (auto& th : pool) {
                     th.join();
                 }
+                BatchTraceStats merged;
+                for (const auto& agg : aggs) {
+                    merged.queries += agg.queries;
+                    merged.requested_probe_count_sum += agg.requested_probe_count_sum;
+                    merged.probe_count_sum += agg.probe_count_sum;
+                    merged.center_probe_ef_sum += agg.center_probe_ef_sum;
+                    merged.ef_sum += agg.ef_sum;
+                    merged.ef_internal_sum += agg.ef_internal_sum;
+                    merged.entry_points_raw_sum += agg.entry_points_raw_sum;
+                    merged.entry_points_before_cap_sum += agg.entry_points_before_cap_sum;
+                    merged.entry_points_after_cap_sum += agg.entry_points_after_cap_sum;
+                    merged.direct_real_entries_sum += agg.direct_real_entries_sum;
+                    merged.anchor_entries_sum += agg.anchor_entries_sum;
+                    merged.fallback_entries_sum += agg.fallback_entries_sum;
+                    merged.center_candidates_sum += agg.center_candidates_sum;
+                    merged.final_candidates_sum += agg.final_candidates_sum;
+                    merged.final_real_candidates_sum += agg.final_real_candidates_sum;
+                    merged.topk_sum += agg.topk_sum;
+                    merged.used_query_graph_sum += agg.used_query_graph_sum;
+                    merged.route_margin_sum += agg.route_margin_sum;
+                    merged.route_margin_count += agg.route_margin_count;
+                    merged.bridge_edges_traversed_sum += agg.bridge_edges_traversed_sum;
+                    merged.bridge_targets_visited_sum += agg.bridge_targets_visited_sum;
+                    merged.bridge_used_sum += agg.bridge_used_sum;
+                    merged.bridge_edges_traversed_max = std::max<int64_t>(merged.bridge_edges_traversed_max, agg.bridge_edges_traversed_max);
+                    merged.entry_points_after_cap_max = std::max<int64_t>(merged.entry_points_after_cap_max, agg.entry_points_after_cap_max);
+                    merged.probe_count_max = std::max<int64_t>(merged.probe_count_max, agg.probe_count_max);
+                    merged.total_ms_sum += agg.total_ms_sum;
+                    merged.route_ms_sum += agg.route_ms_sum;
+                    merged.entry_select_ms_sum += agg.entry_select_ms_sum;
+                    merged.center_search_ms_sum += agg.center_search_ms_sum;
+                    merged.base_search_ms_sum += agg.base_search_ms_sum;
+                    merged.final_rerank_ms_sum += agg.final_rerank_ms_sum;
+                    merged.distance_ms_sum += agg.distance_ms_sum;
+                    merged.jump_ms_sum += agg.jump_ms_sum;
+                    merged.total_ms_max = std::max<double>(merged.total_ms_max, agg.total_ms_max);
+                    merged.distance_ms_max = std::max<double>(merged.distance_ms_max, agg.distance_ms_max);
+                    merged.jump_ms_max = std::max<double>(merged.jump_ms_max, agg.jump_ms_max);
+                    accumulate_layer_stats(merged.center_layer_sum, agg.center_layer_sum);
+                    accumulate_layer_stats(merged.base_layer_sum, agg.base_layer_sum);
+                }
+                last_batch_stats_ = merged;
             }
         }
+        last_batch_stats_valid_ = true;
 
         return py::make_tuple(ids, dists);
     }
 
+
+    py::dict last_query_stats() const {
+        py::dict d;
+        d["available"] = last_query_stats_valid_;
+        if (last_query_stats_valid_) d["stats"] = query_stats_to_dict(last_query_stats_);
+        return d;
+    }
+
+    py::dict last_batch_stats() const {
+        py::dict d;
+        d["available"] = last_batch_stats_valid_;
+        if (last_batch_stats_valid_) d["stats"] = batch_stats_to_dict(last_batch_stats_);
+        return d;
+    }
+
+    void reset_query_stats() const {
+        last_query_stats_ = QueryTraceStats{};
+        last_batch_stats_ = BatchTraceStats{};
+        last_query_stats_valid_ = false;
+        last_batch_stats_valid_ = false;
+    }
+
+
+
+
+    void set_cross_partition_locality(
+        bool enabled,
+        int top_centers = 3,
+        int extra_partitions = 2,
+        int local_topk = 8,
+        int search_ef = 32,
+        int out_degree_per_part = 2,
+        float radius_mul = 1.25f,
+        int query_cross_partition_quota = 1,
+        float ambiguity_rel_gap = 0.10f
+    ) {
+        cross_partition_locality_ = enabled;
+        cross_partition_top_centers_ = std::max(1, top_centers);
+        cross_partition_extra_partitions_ = std::max(0, extra_partitions);
+        cross_partition_local_topk_ = std::max(1, local_topk);
+        cross_partition_search_ef_ = std::max(1, search_ef);
+        cross_partition_out_degree_per_part_ = std::max(0, out_degree_per_part);
+        cross_partition_radius_mul_ = std::max(1.0f, radius_mul);
+        query_cross_partition_quota_ = std::max(0, query_cross_partition_quota);
+        cross_partition_ambiguity_rel_gap_ = std::max(0.0f, ambiguity_rel_gap);
+    }
+
+    void set_rabitq(
+        bool enabled,
+        int bits = 64,
+        int center_keep = 16,
+        int pool_keep = 24,
+        int min_scan = 24
+    ) {
+        rabitq_enabled_ = enabled;
+        rabitq_bits_ = std::max(8, std::min(bits, 64));
+        rabitq_center_keep_ = std::max(4, center_keep);
+        rabitq_pool_keep_ = std::max(4, pool_keep);
+        rabitq_min_scan_ = std::max(4, min_scan);
+    }
 
     py::dict summary() const {
         py::dict d;
@@ -897,8 +1370,35 @@ public:
         d["centers_size"] = static_cast<int>(centers_.size());
         d["avg_center_degree"] = avg_degree(center_adj_);
         d["avg_base_degree"] = avg_degree(base_adj_);
+        d["avg_query_degree"] = avg_degree(query_adj_);
+        d["query_max_degree"] = query_max_degree_;
+        d["entry_points_cap"] = entry_points_cap_;
         d["base_entry"] = base_entry_;
-        d["backend"] = "cpp-stage7";
+        d["cross_partition_locality"] = cross_partition_locality_;
+        d["cross_partition_top_centers"] = cross_partition_top_centers_;
+        d["cross_partition_extra_partitions"] = cross_partition_extra_partitions_;
+        d["cross_partition_local_topk"] = cross_partition_local_topk_;
+        d["cross_partition_search_ef"] = cross_partition_search_ef_;
+        d["cross_partition_out_degree_per_part"] = cross_partition_out_degree_per_part_;
+        d["cross_partition_radius_mul"] = cross_partition_radius_mul_;
+        d["query_cross_partition_quota"] = query_cross_partition_quota_;
+        d["cross_partition_nodes_processed"] = cross_partition_nodes_processed_;
+        d["cross_partition_partition_searches"] = cross_partition_partition_searches_;
+        d["cross_partition_bidirectional_edges_added"] = cross_partition_bidirectional_edges_added_;
+        d["cross_partition_out_edges_added"] = cross_partition_out_edges_added_;
+        d["cross_partition_total_edges_added"] = cross_partition_total_edges_added_;
+        d["cross_partition_edges_survived_in_query_graph"] = cross_partition_edges_survived_in_query_graph_;
+        d["cross_partition_ambiguity_rel_gap"] = cross_partition_ambiguity_rel_gap_;
+        d["cross_partition_ambiguous_points"] = cross_partition_ambiguous_points_;
+        d["rabitq_enabled"] = rabitq_enabled_;
+        d["rabitq_bits"] = rabitq_bits_;
+        d["rabitq_center_keep"] = rabitq_center_keep_;
+        d["rabitq_pool_keep"] = rabitq_pool_keep_;
+        d["rabitq_min_scan"] = rabitq_min_scan_;
+        d["backend"] = "cpp-stage16-tlhl-rabitq-lite";
+        d["distance_kernel"] = "l2_sq = ||q||^2 + ||x||^2 - 2<q,x>";
+        d["last_query_stats_available"] = last_query_stats_valid_;
+        d["last_batch_stats_available"] = last_batch_stats_valid_;
         return d;
     }
 
@@ -929,13 +1429,17 @@ private:
     int base_entry_ = -1;
 
     std::vector<float> centers_;
+    std::vector<float> centers_sq_norms_;
     std::vector<float> base_vectors_;
+    std::vector<float> base_sq_norms_;
     std::vector<int32_t> insertion_entry_points_;
 
     std::vector<std::vector<int>> center_adj_;
     std::vector<std::vector<int>> base_adj_;
+    std::vector<std::vector<int>> query_adj_;
     CSRGraph center_graph_;
     CSRGraph base_graph_;
+    CSRGraph query_graph_;
 
     std::vector<float> router_normals_;
     std::vector<float> router_normal_norms_;
@@ -949,6 +1453,329 @@ private:
 
     std::vector<std::vector<int>> center_real_pool_;
     int center_real_pool_size_ = 32;
+    int query_max_degree_ = 16;
+    int entry_points_cap_ = 16;
+
+    bool cross_partition_locality_ = false;
+    int cross_partition_top_centers_ = 3;
+    int cross_partition_extra_partitions_ = 2;
+    int cross_partition_local_topk_ = 8;
+    int cross_partition_search_ef_ = 32;
+    int cross_partition_out_degree_per_part_ = 2;
+    float cross_partition_radius_mul_ = 1.25f;
+
+    // stage12/stage13: 只对模糊点做增强
+    float cross_partition_ambiguity_rel_gap_ = 0.10f;
+
+    // query graph 保留跨分区边配额
+    int query_cross_partition_quota_ = 1;
+
+    // 每个真实点所属分区
+    std::vector<int32_t> point_partition_;
+
+    // 被标记为跨分区桥边的出边
+    std::vector<std::vector<int32_t>> cross_partition_bridge_out_;
+
+    // build 期统计
+    int64_t cross_partition_nodes_processed_ = 0;
+    int64_t cross_partition_partition_searches_ = 0;
+    int64_t cross_partition_bidirectional_edges_added_ = 0;
+    int64_t cross_partition_out_edges_added_ = 0;
+    int64_t cross_partition_total_edges_added_ = 0;
+    int64_t cross_partition_edges_survived_in_query_graph_ = 0;
+
+
+    // 模糊点计数
+    int64_t cross_partition_ambiguous_points_ = 0;
+
+    // TLHL + RaBitQ-lite prototype settings and buffers.
+    bool rabitq_enabled_ = true;
+    int rabitq_bits_ = 64;
+    int rabitq_center_keep_ = 16;
+    int rabitq_pool_keep_ = 24;
+    int rabitq_min_scan_ = 24;
+    std::vector<float> rabitq_centroid_;
+    std::vector<float> rabitq_proj_; // [bit][dim]
+    std::vector<uint64_t> center_rabitq_codes_;
+    std::vector<uint64_t> base_rabitq_codes_;
+
+    mutable QueryTraceStats last_query_stats_{};
+    mutable BatchTraceStats last_batch_stats_{};
+
+    mutable bool last_query_stats_valid_ = false;
+    mutable bool last_batch_stats_valid_ = false;
+
+    void rebuild_rabitq_codes(uint32_t seed = 42) {
+        if (!rabitq_enabled_ || dim_ <= 0 || base_count_ <= 0) {
+            center_rabitq_codes_.clear();
+            base_rabitq_codes_.clear();
+            rabitq_proj_.clear();
+            rabitq_centroid_.clear();
+            return;
+        }
+        rabitq_centroid_.assign(static_cast<size_t>(dim_), 0.0f);
+        int real_cnt = std::max(0, base_count_ - center_count_);
+        if (real_cnt > 0) {
+            for (int gid = center_count_; gid < base_count_; ++gid) {
+                const float* p = &base_vectors_[static_cast<size_t>(gid) * dim_];
+                for (int j = 0; j < dim_; ++j) rabitq_centroid_[static_cast<size_t>(j)] += p[j];
+            }
+            for (float& x : rabitq_centroid_) x /= static_cast<float>(real_cnt);
+        }
+        const int bits = std::max(8, std::min(rabitq_bits_, 64));
+        rabitq_bits_ = bits;
+        rabitq_proj_.assign(static_cast<size_t>(bits) * dim_, 0.0f);
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (int b = 0; b < bits; ++b) {
+            std::vector<float> col(static_cast<size_t>(dim_), 0.0f);
+            bool ok = false;
+            for (int retry = 0; retry < 8 && !ok; ++retry) {
+                for (int j = 0; j < dim_; ++j) col[static_cast<size_t>(j)] = nd(rng);
+                for (int p = 0; p < b; ++p) {
+                    const float* prev = &rabitq_proj_[static_cast<size_t>(p) * dim_];
+                    float proj = dot_ptr(col.data(), prev, dim_);
+                    for (int j = 0; j < dim_; ++j) col[static_cast<size_t>(j)] -= proj * prev[j];
+                }
+                float n2 = sq_norm_ptr(col.data(), dim_);
+                if (n2 > 1e-6f) {
+                    float inv = 1.0f / std::sqrt(n2);
+                    for (int j = 0; j < dim_; ++j) rabitq_proj_[static_cast<size_t>(b) * dim_ + static_cast<size_t>(j)] = col[static_cast<size_t>(j)] * inv;
+                    ok = true;
+                }
+            }
+            if (!ok) {
+                for (int j = 0; j < dim_; ++j) rabitq_proj_[static_cast<size_t>(b) * dim_ + static_cast<size_t>(j)] = (j == (b % dim_)) ? 1.0f : 0.0f;
+            }
+        }
+        center_rabitq_codes_.assign(static_cast<size_t>(center_count_), 0);
+        for (int i = 0; i < center_count_; ++i) {
+            center_rabitq_codes_[static_cast<size_t>(i)] = encode_rabitq_code(&centers_[static_cast<size_t>(i) * dim_]);
+        }
+        base_rabitq_codes_.assign(static_cast<size_t>(base_count_), 0);
+        for (int i = 0; i < base_count_; ++i) {
+            base_rabitq_codes_[static_cast<size_t>(i)] = encode_rabitq_code(&base_vectors_[static_cast<size_t>(i) * dim_]);
+        }
+    }
+
+    uint64_t encode_rabitq_code(const float* vec) const {
+        if (dim_ <= 0 || rabitq_proj_.empty()) return 0;
+        std::vector<float> tmp(static_cast<size_t>(dim_), 0.0f);
+        for (int j = 0; j < dim_; ++j) tmp[static_cast<size_t>(j)] = vec[j] - (rabitq_centroid_.empty() ? 0.0f : rabitq_centroid_[static_cast<size_t>(j)]);
+        float n2 = sq_norm_ptr(tmp.data(), dim_);
+        if (n2 <= 1e-12f) {
+            for (int j = 0; j < dim_; ++j) tmp[static_cast<size_t>(j)] = vec[j];
+            n2 = sq_norm_ptr(tmp.data(), dim_);
+        }
+        float inv = 1.0f / std::sqrt(std::max(1e-12f, n2));
+        for (float& x : tmp) x *= inv;
+        uint64_t code = 0;
+        const int bits = std::max(0, std::min(rabitq_bits_, 64));
+        for (int b = 0; b < bits; ++b) {
+            const float* proj = &rabitq_proj_[static_cast<size_t>(b) * dim_];
+            float s = dot_ptr(tmp.data(), proj, dim_);
+            if (s >= 0.0f) code |= (uint64_t(1) << b);
+        }
+        return code;
+    }
+
+    std::vector<int> rabitq_rank_candidates(const float* query, const std::vector<int>& cand, bool centers_space, int keep) const {
+        if (!rabitq_enabled_ || cand.empty()) return cand;
+        uint64_t qcode = encode_rabitq_code(query);
+        std::vector<RabitqScoredId> scored;
+        scored.reserve(cand.size());
+        for (int id : cand) {
+            uint64_t code = 0;
+            if (centers_space) {
+                if (id < 0 || id >= static_cast<int>(center_rabitq_codes_.size())) continue;
+                code = center_rabitq_codes_[static_cast<size_t>(id)];
+            } else {
+                if (id < 0 || id >= static_cast<int>(base_rabitq_codes_.size())) continue;
+                code = base_rabitq_codes_[static_cast<size_t>(id)];
+            }
+            scored.push_back({id, popcount_u64(qcode ^ code)});
+        }
+        if (scored.empty()) return {};
+        keep = std::max(1, std::min(keep, static_cast<int>(scored.size())));
+        std::nth_element(scored.begin(), scored.begin() + keep - 1, scored.end(), [](const RabitqScoredId& a, const RabitqScoredId& b) {
+            return a.ham < b.ham;
+        });
+        scored.resize(static_cast<size_t>(keep));
+        std::sort(scored.begin(), scored.end(), [](const RabitqScoredId& a, const RabitqScoredId& b) {
+            if (a.ham != b.ham) return a.ham < b.ham;
+            return a.id < b.id;
+        });
+        std::vector<int> out;
+        out.reserve(scored.size());
+        for (const auto& x : scored) out.push_back(x.id);
+        return out;
+    }
+
+    static void accumulate_layer_stats(LayerTraceStats& dst, const LayerTraceStats& src) {
+        dst.entry_points += src.entry_points;
+        dst.seed_pushes += src.seed_pushes;
+        dst.heap_pushes += src.heap_pushes;
+        dst.heap_pops += src.heap_pops;
+        dst.visited_nodes += src.visited_nodes;
+        dst.node_expansions += src.node_expansions;
+        dst.edges_scanned += src.edges_scanned;
+        dst.distance_evals += src.distance_evals;
+        dst.early_breaks += src.early_breaks;
+        dst.result_count += src.result_count;
+    }
+
+    static void accumulate_batch_stats(BatchTraceStats& dst, const QueryTraceStats& src) {
+        dst.queries += 1;
+        dst.requested_probe_count_sum += src.requested_probe_count;
+        dst.probe_count_sum += src.probe_count;
+        dst.center_probe_ef_sum += src.center_probe_ef;
+        dst.ef_sum += src.ef;
+        dst.ef_internal_sum += src.ef_internal;
+        dst.entry_points_raw_sum += src.entry_points_raw;
+        dst.entry_points_before_cap_sum += src.entry_points_before_cap;
+        dst.entry_points_after_cap_sum += src.entry_points_after_cap;
+        dst.direct_real_entries_sum += src.direct_real_entries;
+        dst.anchor_entries_sum += src.anchor_entries;
+        dst.fallback_entries_sum += src.fallback_entries;
+        dst.center_candidates_sum += src.center_candidates;
+        dst.final_candidates_sum += src.final_candidates;
+        dst.final_real_candidates_sum += src.final_real_candidates;
+        dst.topk_sum += src.topk;
+        dst.used_query_graph_sum += src.used_query_graph;
+        dst.route_margin_sum += src.route_margin;
+        dst.route_margin_count += 1;
+        dst.bridge_edges_traversed_sum += src.bridge_edges_traversed;
+        dst.bridge_targets_visited_sum += src.bridge_targets_visited;
+        dst.bridge_used_sum += src.bridge_used;
+        dst.bridge_edges_traversed_max = std::max<int64_t>(dst.bridge_edges_traversed_max, src.bridge_edges_traversed);
+        dst.entry_points_after_cap_max = std::max<int64_t>(dst.entry_points_after_cap_max, src.entry_points_after_cap);
+        dst.probe_count_max = std::max<int64_t>(dst.probe_count_max, src.probe_count);
+        dst.total_ms_sum += src.total_ms;
+        dst.route_ms_sum += src.route_ms;
+        dst.entry_select_ms_sum += src.entry_select_ms;
+        dst.center_search_ms_sum += src.center_search_ms;
+        dst.base_search_ms_sum += src.base_search_ms;
+        dst.final_rerank_ms_sum += src.final_rerank_ms;
+        dst.distance_ms_sum += src.distance_ms;
+        dst.jump_ms_sum += src.jump_ms;
+        dst.total_ms_max = std::max<double>(dst.total_ms_max, src.total_ms);
+        dst.distance_ms_max = std::max<double>(dst.distance_ms_max, src.distance_ms);
+        dst.jump_ms_max = std::max<double>(dst.jump_ms_max, src.jump_ms);
+        accumulate_layer_stats(dst.center_layer_sum, src.center_layer);
+        accumulate_layer_stats(dst.base_layer_sum, src.base_layer);
+    }
+
+    static py::dict layer_stats_to_dict(const LayerTraceStats& s) {
+        py::dict d;
+        d["entry_points"] = s.entry_points;
+        d["seed_pushes"] = s.seed_pushes;
+        d["heap_pushes"] = s.heap_pushes;
+        d["heap_pops"] = s.heap_pops;
+        d["visited_nodes"] = s.visited_nodes;
+        d["node_expansions"] = s.node_expansions;
+        d["edges_scanned"] = s.edges_scanned;
+        d["distance_evals"] = s.distance_evals;
+        d["early_breaks"] = s.early_breaks;
+        d["result_count"] = s.result_count;
+        return d;
+    }
+
+    py::dict query_stats_to_dict(const QueryTraceStats& s) const {
+        py::dict d;
+        d["requested_probe_count"] = s.requested_probe_count;
+        d["probe_count"] = s.probe_count;
+        d["center_probe_ef"] = s.center_probe_ef;
+        d["ef"] = s.ef;
+        d["ef_internal"] = s.ef_internal;
+        d["entry_points_raw"] = s.entry_points_raw;
+        d["entry_points_before_cap"] = s.entry_points_before_cap;
+        d["entry_points_after_cap"] = s.entry_points_after_cap;
+        d["direct_real_entries"] = s.direct_real_entries;
+        d["anchor_entries"] = s.anchor_entries;
+        d["fallback_entries"] = s.fallback_entries;
+        d["center_candidates"] = s.center_candidates;
+        d["final_candidates"] = s.final_candidates;
+        d["final_real_candidates"] = s.final_real_candidates;
+        d["topk"] = s.topk;
+        d["used_query_graph"] = static_cast<bool>(s.used_query_graph != 0);
+        d["route_center_id"] = s.route_center_id;
+        d["route_margin"] = s.route_margin;
+        d["bridge_edges_traversed"] = s.bridge_edges_traversed;
+        d["bridge_targets_visited"] = s.bridge_targets_visited;
+        d["bridge_used"] = static_cast<bool>(s.bridge_used != 0);
+        d["total_ms"] = s.total_ms;
+        d["route_ms"] = s.route_ms;
+        d["entry_select_ms"] = s.entry_select_ms;
+        d["center_search_ms"] = s.center_search_ms;
+        d["base_search_ms"] = s.base_search_ms;
+        d["final_rerank_ms"] = s.final_rerank_ms;
+        d["distance_ms"] = s.distance_ms;
+        d["jump_ms"] = s.jump_ms;
+        d["center_layer"] = layer_stats_to_dict(s.center_layer);
+        d["base_layer"] = layer_stats_to_dict(s.base_layer);
+        return d;
+    }
+
+    py::dict batch_stats_to_dict(const BatchTraceStats& s) const {
+        py::dict d;
+        d["queries"] = s.queries;
+        d["requested_probe_count_sum"] = s.requested_probe_count_sum;
+        d["probe_count_sum"] = s.probe_count_sum;
+        d["center_probe_ef_sum"] = s.center_probe_ef_sum;
+        d["ef_sum"] = s.ef_sum;
+        d["ef_internal_sum"] = s.ef_internal_sum;
+        d["entry_points_raw_sum"] = s.entry_points_raw_sum;
+        d["entry_points_before_cap_sum"] = s.entry_points_before_cap_sum;
+        d["entry_points_after_cap_sum"] = s.entry_points_after_cap_sum;
+        d["direct_real_entries_sum"] = s.direct_real_entries_sum;
+        d["anchor_entries_sum"] = s.anchor_entries_sum;
+        d["fallback_entries_sum"] = s.fallback_entries_sum;
+        d["center_candidates_sum"] = s.center_candidates_sum;
+        d["final_candidates_sum"] = s.final_candidates_sum;
+        d["final_real_candidates_sum"] = s.final_real_candidates_sum;
+        d["topk_sum"] = s.topk_sum;
+        d["used_query_graph_sum"] = s.used_query_graph_sum;
+        d["route_margin_sum"] = s.route_margin_sum;
+        d["route_margin_count"] = s.route_margin_count;
+        d["bridge_edges_traversed_sum"] = s.bridge_edges_traversed_sum;
+        d["bridge_targets_visited_sum"] = s.bridge_targets_visited_sum;
+        d["bridge_used_sum"] = s.bridge_used_sum;
+        d["bridge_edges_traversed_max"] = s.bridge_edges_traversed_max;
+        d["entry_points_after_cap_max"] = s.entry_points_after_cap_max;
+        d["probe_count_max"] = s.probe_count_max;
+        d["total_ms_sum"] = s.total_ms_sum;
+        d["route_ms_sum"] = s.route_ms_sum;
+        d["entry_select_ms_sum"] = s.entry_select_ms_sum;
+        d["center_search_ms_sum"] = s.center_search_ms_sum;
+        d["base_search_ms_sum"] = s.base_search_ms_sum;
+        d["final_rerank_ms_sum"] = s.final_rerank_ms_sum;
+        d["distance_ms_sum"] = s.distance_ms_sum;
+        d["jump_ms_sum"] = s.jump_ms_sum;
+        d["total_ms_max"] = s.total_ms_max;
+        d["distance_ms_max"] = s.distance_ms_max;
+        d["jump_ms_max"] = s.jump_ms_max;
+        if (s.queries > 0) {
+            d["probe_count_avg"] = static_cast<double>(s.probe_count_sum) / static_cast<double>(s.queries);
+            d["entry_points_after_cap_avg"] = static_cast<double>(s.entry_points_after_cap_sum) / static_cast<double>(s.queries);
+            d["final_candidates_avg"] = static_cast<double>(s.final_candidates_sum) / static_cast<double>(s.queries);
+            d["final_real_candidates_avg"] = static_cast<double>(s.final_real_candidates_sum) / static_cast<double>(s.queries);
+            d["route_margin_avg"] = s.route_margin_count > 0 ? static_cast<double>(s.route_margin_sum) / static_cast<double>(s.route_margin_count) : 0.0;
+            d["bridge_edges_traversed_avg"] = static_cast<double>(s.bridge_edges_traversed_sum) / static_cast<double>(s.queries);
+            d["bridge_targets_visited_avg"] = static_cast<double>(s.bridge_targets_visited_sum) / static_cast<double>(s.queries);
+            d["bridge_used_ratio"] = static_cast<double>(s.bridge_used_sum) / static_cast<double>(s.queries);
+            d["total_ms_avg"] = s.total_ms_sum / static_cast<double>(s.queries);
+            d["route_ms_avg"] = s.route_ms_sum / static_cast<double>(s.queries);
+            d["entry_select_ms_avg"] = s.entry_select_ms_sum / static_cast<double>(s.queries);
+            d["center_search_ms_avg"] = s.center_search_ms_sum / static_cast<double>(s.queries);
+            d["base_search_ms_avg"] = s.base_search_ms_sum / static_cast<double>(s.queries);
+            d["final_rerank_ms_avg"] = s.final_rerank_ms_sum / static_cast<double>(s.queries);
+            d["distance_ms_avg"] = s.distance_ms_sum / static_cast<double>(s.queries);
+            d["jump_ms_avg"] = s.jump_ms_sum / static_cast<double>(s.queries);
+        }
+        d["center_layer_sum"] = layer_stats_to_dict(s.center_layer_sum);
+        d["base_layer_sum"] = layer_stats_to_dict(s.base_layer_sum);
+        return d;
+    }
 
     static double avg_degree(const std::vector<std::vector<int>>& adj) {
         if (adj.empty()) return 0.0;
@@ -966,6 +1793,238 @@ private:
         threads = std::max(1, std::min(threads, nq));
         return threads;
     }
+    int partition_of_real_gid(int gid) const {
+        if (gid < center_count_ || gid >= base_count_) return -1;
+        const int rid = gid - center_count_;
+        if (rid < 0 || rid >= static_cast<int>(insertion_entry_points_.size())) return -1;
+        return insertion_entry_points_[static_cast<size_t>(rid)];
+    }
+
+    bool is_real_gid(int gid) const {
+        return gid >= center_count_ && gid < base_count_;
+    }
+
+    static void append_unique(std::vector<int>& out, int x) {
+        if (x < 0) return;
+        if (std::find(out.begin(), out.end(), x) == out.end()) out.push_back(x);
+    }
+
+    std::vector<int> make_partition_entry_points(int cid) const {
+        std::vector<int> entry_points;
+        if (cid < 0 || cid >= center_count_) return entry_points;
+        append_unique(entry_points, cid);
+        if (cid < static_cast<int>(center_real_pool_.size())) {
+            const auto& pool = center_real_pool_[static_cast<size_t>(cid)];
+            for (int x : pool) {
+                append_unique(entry_points, x);
+                if (static_cast<int>(entry_points.size()) >= 8) break;
+            }
+        }
+        if (!center_anchor_offsets_.empty() && cid + 1 < static_cast<int>(center_anchor_offsets_.size())) {
+            const int64_t s = center_anchor_offsets_[static_cast<size_t>(cid)];
+            const int64_t e = center_anchor_offsets_[static_cast<size_t>(cid + 1)];
+            for (int64_t p = s; p < e; ++p) {
+                append_unique(entry_points, center_anchor_indices_[static_cast<size_t>(p)]);
+                if (static_cast<int>(entry_points.size()) >= 12) break;
+            }
+        }
+        if (entry_points.empty()) append_unique(entry_points, cid);
+        return entry_points;
+    }
+
+    std::vector<int> top_nearest_centers_for_point(const float* query, int topn) const {
+        const float qn = sq_norm_ptr(query, dim_);
+        std::vector<CandidateDist> items;
+        items.reserve(static_cast<size_t>(center_count_));
+        for (int cid = 0; cid < center_count_; ++cid) {
+            items.push_back({cid, l2_sq_query_to_vec_normed(query, qn, &centers_[static_cast<size_t>(cid) * dim_], centers_sq_norms_[static_cast<size_t>(cid)], dim_)});
+        }
+        std::sort(items.begin(), items.end(), [](const CandidateDist& a, const CandidateDist& b) { return a.dist < b.dist; });
+        std::vector<int> out;
+        const int keep = std::min(topn, static_cast<int>(items.size()));
+        out.reserve(static_cast<size_t>(keep));
+        for (int i = 0; i < keep; ++i) out.push_back(items[static_cast<size_t>(i)].id);
+        return out;
+    }
+
+    bool is_ambiguous_point_for_cross_partition(const float* query) const {
+        if (center_count_ <= 1) return false;
+        float best1 = std::numeric_limits<float>::infinity();
+        float best2 = std::numeric_limits<float>::infinity();
+        for (int cid = 0; cid < center_count_; ++cid) {
+            const float d = l2_sq_ptr(query, &centers_[static_cast<size_t>(cid) * dim_], dim_);
+            if (d < best1) {
+                best2 = best1;
+                best1 = d;
+            } else if (d < best2) {
+                best2 = d;
+            }
+        }
+        if (!std::isfinite(best1) || !std::isfinite(best2)) return false;
+        const float denom = std::max(best1, 1e-6f);
+        const float rel_gap = (best2 - best1) / denom;
+        return rel_gap <= cross_partition_ambiguity_rel_gap_;
+    }
+
+
+    std::vector<int> search_partition_topk(
+        const float* query,
+        int target_cid,
+        int topk,
+        int ef,
+        SearchWorkspace& ws,
+        int exclude_gid = -1
+    ) {
+        if (target_cid < 0 || target_cid >= center_count_) return {};
+        std::vector<int> entry_points = make_partition_entry_points(target_cid);
+        const float query_sq_norm = sq_norm_ptr(query, dim_);
+        std::vector<int> cand = search_layer_list(
+            query,
+            entry_points,
+            base_vectors_,
+            &base_sq_norms_,
+            query_sq_norm,
+            base_count_,
+            dim_,
+            base_adj_,
+            std::max(topk, ef),
+            ws,
+            nullptr
+        );
+
+        std::vector<int> filtered;
+        filtered.reserve(cand.size());
+        for (int gid : cand) {
+            if (!is_real_gid(gid)) continue;
+            if (gid == exclude_gid) continue;
+            if (partition_of_real_gid(gid) != target_cid) continue;
+            append_unique(filtered, gid);
+        }
+
+        if (static_cast<int>(filtered.size()) < topk && target_cid < static_cast<int>(center_real_pool_.size())) {
+            for (int gid : center_real_pool_[static_cast<size_t>(target_cid)]) {
+                if (gid == exclude_gid) continue;
+                if (!is_real_gid(gid)) continue;
+                append_unique(filtered, gid);
+                if (static_cast<int>(filtered.size()) >= topk * 2) break;
+            }
+        }
+
+        filtered = exact_sorted_ids(query, base_vectors_, dim_, filtered);
+        if (static_cast<int>(filtered.size()) > topk) filtered.resize(static_cast<size_t>(topk));
+        return filtered;
+    }
+
+    void add_directed_edge_pruned(int src, int dst, int degree_limit) {
+        if (src < 0 || dst < 0 || src >= base_count_ || dst >= base_count_ || src == dst) return;
+        auto& row = base_adj_[static_cast<size_t>(src)];
+        if (std::find(row.begin(), row.end(), dst) != row.end()) return;
+        row.push_back(dst);
+        if (static_cast<int>(row.size()) > degree_limit) {
+            row = heuristic_select(
+                &base_vectors_[static_cast<size_t>(src) * dim_],
+                row,
+                base_vectors_,
+                dim_,
+                degree_limit
+            );
+        }
+    }
+
+    void merge_bidirectional_edges(int src, const std::vector<int>& neighbors, int src_limit, int dst_limit) {
+        if (src < 0 || src >= base_count_) return;
+        std::vector<int> merged = base_adj_[static_cast<size_t>(src)];
+        merged.reserve(merged.size() + neighbors.size());
+        for (int nb : neighbors) {
+            if (nb >= 0 && nb != src) merged.push_back(nb);
+        }
+        base_adj_[static_cast<size_t>(src)] = heuristic_select(
+            &base_vectors_[static_cast<size_t>(src) * dim_],
+            merged,
+            base_vectors_,
+            dim_,
+            src_limit
+        );
+        for (int nb : neighbors) {
+            add_directed_edge_pruned(nb, src, dst_limit);
+        }
+    }
+
+    void augment_cross_partition_locality() {
+        if (!cross_partition_locality_) return;
+        if (center_count_ <= 0 || base_count_ <= center_count_) return;
+
+        if (cross_partition_bridge_out_.size() != static_cast<size_t>(base_count_)) {
+            cross_partition_bridge_out_.assign(static_cast<size_t>(base_count_), {});
+        } else {
+            for (auto& row : cross_partition_bridge_out_) row.clear();
+        }
+
+        SearchWorkspace ws(base_count_);
+        const int local_topk = std::max(1, cross_partition_local_topk_);
+        const int search_ef = std::max(local_topk * 4, cross_partition_search_ef_);
+
+        for (int gid = center_count_; gid < base_count_; ++gid) {
+            const float* query = &base_vectors_[static_cast<size_t>(gid) * dim_];
+            const int cp = partition_of_real_gid(gid);
+            if (cp < 0 || cp >= center_count_) continue;
+            cross_partition_nodes_processed_ += 1;
+            if (!is_ambiguous_point_for_cross_partition(query)) continue;
+            cross_partition_ambiguous_points_ += 1;
+
+            std::vector<int> set0 = search_partition_topk(query, cp, local_topk, search_ef, ws, gid);
+            cross_partition_partition_searches_ += 1;
+            if (!set0.empty()) {
+                merge_bidirectional_edges(gid, set0, base_max_degree_, base_max_degree_);
+                cross_partition_bidirectional_edges_added_ += static_cast<int64_t>(set0.size()) * 2;
+                cross_partition_total_edges_added_ += static_cast<int64_t>(set0.size()) * 2;
+            }
+
+            float local_radius = std::numeric_limits<float>::infinity();
+            if (!set0.empty()) {
+                local_radius = 0.0f;
+                for (int nb : set0) {
+                    local_radius = std::max(local_radius, l2_sq_ptr(query, &base_vectors_[static_cast<size_t>(nb) * dim_], dim_));
+                }
+            }
+
+            std::vector<int> near_centers = top_nearest_centers_for_point(query, std::max(1, cross_partition_top_centers_));
+            int used_extra = 0;
+            for (int cid : near_centers) {
+                if (cid == cp) continue;
+                if (used_extra >= cross_partition_extra_partitions_) break;
+
+                std::vector<int> setx = search_partition_topk(query, cid, local_topk, search_ef, ws, gid);
+                cross_partition_partition_searches_ += 1;
+                if (setx.empty()) continue;
+
+                for (int nb : setx) {
+                    add_directed_edge_pruned(nb, gid, base_max_degree_);
+                }
+
+                std::vector<int> monotonic_out;
+                monotonic_out.reserve(static_cast<size_t>(cross_partition_out_degree_per_part_));
+                for (int nb : setx) {
+                    const float d = l2_sq_ptr(query, &base_vectors_[static_cast<size_t>(nb) * dim_], dim_);
+                    if (std::find(base_adj_[static_cast<size_t>(gid)].begin(), base_adj_[static_cast<size_t>(gid)].end(), nb) != base_adj_[static_cast<size_t>(gid)].end()) {
+                        continue;
+                    }
+                    if (!std::isfinite(local_radius) || d <= local_radius * cross_partition_radius_mul_ || monotonic_out.empty()) {
+                        monotonic_out.push_back(nb);
+                        if (static_cast<int>(monotonic_out.size()) >= cross_partition_out_degree_per_part_) break;
+                    }
+                }
+                for (int nb : monotonic_out) {
+                    add_directed_edge_pruned(gid, nb, base_max_degree_ + cross_partition_extra_partitions_ * std::max(1, cross_partition_out_degree_per_part_));
+                    append_unique(cross_partition_bridge_out_[static_cast<size_t>(gid)], nb);
+                    cross_partition_out_edges_added_ += 1;
+                    cross_partition_total_edges_added_ += 1;
+                }
+                used_extra += 1;
+            }
+        }
+    }
+
     void build_center_real_pool(int pool_size) {
         center_real_pool_.assign(static_cast<size_t>(center_count_), {});
         if (center_count_ <= 0 || base_count_ <= center_count_ || pool_size <= 0) {
@@ -1488,10 +2547,11 @@ private:
 
     RouteDecision route_center_with_margin(const float* query) const {
         if (router_nodes_ == 0 || center_count_ == 0) {
+            const float qn = sq_norm_ptr(query, dim_);
             int best = 0;
-            float best_d = center_count_ > 0 ? l2_sq_ptr(query, &centers_[0], dim_) : 0.0f;
+            float best_d = center_count_ > 0 ? l2_sq_query_to_vec_normed(query, qn, &centers_[0], centers_sq_norms_[0], dim_) : 0.0f;
             for (int i = 1; i < center_count_; ++i) {
-                float d = l2_sq_ptr(query, &centers_[static_cast<size_t>(i) * dim_], dim_);
+                float d = l2_sq_query_to_vec_normed(query, qn, &centers_[static_cast<size_t>(i) * dim_], centers_sq_norms_[static_cast<size_t>(i)], dim_);
                 if (d < best_d) {
                     best_d = d;
                     best = i;
@@ -1563,101 +2623,371 @@ private:
         return out;
     }
 
+    std::vector<int> get_center_real_entry_points(
+        int center_id,
+        const float* query,
+        int max_take
+    ) const {
+        std::vector<int> out;
+        if (max_take <= 0) return out;
+        if (center_id < 0 || center_id >= static_cast<int>(center_real_pool_.size())) return out;
+        const auto& pool = center_real_pool_[static_cast<size_t>(center_id)];
+        if (pool.empty()) return out;
+        std::vector<int> pool_cand;
+        pool_cand.reserve(pool.size());
+        for (int gid : pool) {
+            if (gid >= center_count_ && gid < base_count_) pool_cand.push_back(gid);
+        }
+        if (pool_cand.empty()) return out;
+        if (rabitq_enabled_ && static_cast<int>(pool_cand.size()) >= rabitq_min_scan_) {
+            pool_cand = rabitq_rank_candidates(query, pool_cand, false, std::min(rabitq_pool_keep_, static_cast<int>(pool_cand.size())));
+        }
+        const float qn = sq_norm_ptr(query, dim_);
+        std::vector<CandidateDist> scored;
+        scored.reserve(pool_cand.size());
+        for (int gid : pool_cand) {
+            scored.push_back({gid, l2_sq_query_to_vec_normed(query, qn, &base_vectors_[static_cast<size_t>(gid) * dim_], base_sq_norms_[static_cast<size_t>(gid)], dim_)});
+        }
+        if (scored.empty()) return out;
+        const int take = std::min(max_take, static_cast<int>(scored.size()));
+        std::nth_element(scored.begin(), scored.begin() + take - 1, scored.end(), [](const CandidateDist& a, const CandidateDist& b) {
+            return a.dist < b.dist;
+        });
+        scored.resize(static_cast<size_t>(take));
+        std::sort(scored.begin(), scored.end(), [](const CandidateDist& a, const CandidateDist& b) {
+            return a.dist < b.dist;
+        });
+        out.reserve(static_cast<size_t>(take));
+        for (const auto& x : scored) out.push_back(x.id);
+        return out;
+    }
+
+    void build_query_graph_from_base() {
+        query_adj_.assign(static_cast<size_t>(base_count_), {});
+        cross_partition_edges_survived_in_query_graph_ = 0;
+        if (base_count_ <= 0) return;
+        query_max_degree_ = std::min(base_max_degree_, std::max(12, m_ + 2));
+        if (query_max_degree_ <= 0) query_max_degree_ = std::min(base_max_degree_, 16);
+
+        const int cross_quota = std::max(0, std::min(query_cross_partition_quota_, query_max_degree_));
+        const int local_quota = std::max(0, query_max_degree_ - cross_quota);
+
+        std::vector<std::vector<int>> raw(static_cast<size_t>(base_count_));
+        for (int gid = center_count_; gid < base_count_; ++gid) {
+            std::vector<int> cand;
+            cand.reserve(base_adj_[static_cast<size_t>(gid)].size());
+            for (int nb : base_adj_[static_cast<size_t>(gid)]) {
+                if (nb >= center_count_ && nb != gid) cand.push_back(nb);
+            }
+            cand = unique_keep_order(cand);
+
+            if (cand.empty()) {
+                raw[static_cast<size_t>(gid)] = {};
+                continue;
+            }
+
+            std::vector<int> local_cands;
+            std::vector<int> cross_bridge_cands;
+            std::vector<int> cross_other_cands;
+            const int cp = partition_of_real_gid(gid);
+
+            for (int nb : cand) {
+                const int np = partition_of_real_gid(nb);
+                bool is_bridge = false;
+                if (gid < static_cast<int>(cross_partition_bridge_out_.size())) {
+                    const auto& bridges = cross_partition_bridge_out_[static_cast<size_t>(gid)];
+                    if (std::find(bridges.begin(), bridges.end(), nb) != bridges.end()) {
+                        is_bridge = true;
+                    }
+                }
+
+                if (cp >= 0 && np >= 0 && cp != np) {
+                    if (is_bridge) cross_bridge_cands.push_back(nb);
+                    else cross_other_cands.push_back(nb);
+                } else {
+                    local_cands.push_back(nb);
+                }
+            }
+
+            std::vector<int> selected;
+            selected.reserve(static_cast<size_t>(query_max_degree_));
+
+            if (cross_quota > 0) {
+                std::vector<int> bridge_pick = heuristic_select(
+                    &base_vectors_[static_cast<size_t>(gid) * dim_],
+                    cross_bridge_cands,
+                    base_vectors_,
+                    dim_,
+                    cross_quota
+                );
+                for (int nb : bridge_pick) append_unique(selected, nb);
+
+                if (static_cast<int>(selected.size()) < cross_quota) {
+                    std::vector<int> cross_other_pick = heuristic_select(
+                        &base_vectors_[static_cast<size_t>(gid) * dim_],
+                        cross_other_cands,
+                        base_vectors_,
+                        dim_,
+                        cross_quota - static_cast<int>(selected.size())
+                    );
+                    for (int nb : cross_other_pick) append_unique(selected, nb);
+                }
+            }
+
+            cross_partition_edges_survived_in_query_graph_ += static_cast<int64_t>(selected.size());
+
+            if (local_quota > 0) {
+                std::vector<int> local_pick = heuristic_select(
+                    &base_vectors_[static_cast<size_t>(gid) * dim_],
+                    local_cands,
+                    base_vectors_,
+                    dim_,
+                    local_quota
+                );
+                for (int nb : local_pick) append_unique(selected, nb);
+            }
+
+            if (static_cast<int>(selected.size()) < query_max_degree_) {
+                std::vector<int> fill_pick = heuristic_select(
+                    &base_vectors_[static_cast<size_t>(gid) * dim_],
+                    cand,
+                    base_vectors_,
+                    dim_,
+                    query_max_degree_
+                );
+                for (int nb : fill_pick) {
+                    append_unique(selected, nb);
+                    if (static_cast<int>(selected.size()) >= query_max_degree_) break;
+                }
+            }
+
+            if (static_cast<int>(selected.size()) > query_max_degree_) {
+                selected = heuristic_select(
+                    &base_vectors_[static_cast<size_t>(gid) * dim_],
+                    selected,
+                    base_vectors_,
+                    dim_,
+                    query_max_degree_
+                );
+            }
+
+            raw[static_cast<size_t>(gid)] = std::move(selected);
+        }
+
+        query_adj_ = raw;
+        for (int gid = center_count_; gid < base_count_; ++gid) {
+            for (int nb : raw[static_cast<size_t>(gid)]) {
+                if (nb < center_count_ || nb == gid) continue;
+                auto& row = query_adj_[static_cast<size_t>(nb)];
+                if (std::find(row.begin(), row.end(), gid) == row.end()) row.push_back(gid);
+                if (static_cast<int>(row.size()) > query_max_degree_) {
+                    row = heuristic_select(
+                        &base_vectors_[static_cast<size_t>(nb) * dim_],
+                        row,
+                        base_vectors_,
+                        dim_,
+                        query_max_degree_
+                    );
+                }
+            }
+        }
+
+        for (int vid = 0; vid < center_count_; ++vid) query_adj_[static_cast<size_t>(vid)].clear();
+    }
+
     std::pair<std::vector<int>, std::vector<float>> search_impl(
         const float* query,
         int k,
         int ef,
         int requested_probe_count,
         SearchWorkspace& center_ws,
-        SearchWorkspace& base_ws
+        SearchWorkspace& base_ws,
+        QueryTraceStats* trace = nullptr
     ) const {
         if (base_count_ == 0) return {{}, {}};
 
-        RouteDecision decision = route_center_with_margin(query);
-        int probe_count = adaptive_probe_count(std::max(1, requested_probe_count), decision.margin);
+        const double query_t0_ms = now_ms_clock();
+        double accum_distance_ms = 0.0;
+        double accum_jump_ms = 0.0;
 
-        std::vector<int> probe_ids;
+        const float query_sq_norm = sq_norm_ptr(query, dim_);
+        const double route_t0_ms = now_ms_clock();
+        RouteDecision decision = route_center_with_margin(query);
+        const double route_ms = now_ms_clock() - route_t0_ms;
+
+        int probe_count = adaptive_probe_count(std::max(1, requested_probe_count), decision.margin);
+        if (trace) {
+            trace->requested_probe_count = std::max(1, requested_probe_count);
+            trace->probe_count = probe_count;
+            trace->ef = ef;
+            trace->route_center_id = decision.center_id;
+            trace->route_margin = decision.margin;
+            trace->route_ms = route_ms;
+        }
+
+        auto& probe_ids = center_ws.scratch_ids_a;
+        probe_ids.clear();
+        const double center_search_t0_ms = now_ms_clock();
         if (center_count_ > 0) {
             if (probe_count <= 1 || center_graph_.n_nodes() == 0) {
-                probe_ids.push_back(decision.center_id);
+                std::vector<int> local_center_cand;
+                local_center_cand.push_back(decision.center_id);
+                if (decision.center_id >= 0 && decision.center_id < static_cast<int>(center_adj_.size())) {
+                    for (int nb : center_adj_[static_cast<size_t>(decision.center_id)]) local_center_cand.push_back(nb);
+                }
+                local_center_cand = unique_keep_order(local_center_cand);
+                if (rabitq_enabled_ && static_cast<int>(local_center_cand.size()) >= rabitq_min_scan_) {
+                    local_center_cand = rabitq_rank_candidates(query, local_center_cand, true, std::min(rabitq_center_keep_, static_cast<int>(local_center_cand.size())));
+                }
+                probe_ids = exact_sorted_ids(query, centers_, dim_, local_center_cand, &centers_sq_norms_, query_sq_norm);
+                if (probe_ids.empty()) probe_ids.push_back(decision.center_id);
+                if (static_cast<int>(probe_ids.size()) > probe_count) probe_ids.resize(static_cast<size_t>(probe_count));
             } else {
-                int center_probe_ef = std::max(probe_count, std::min(center_probe_ef_cap_, center_count_));
+                int center_probe_ef = std::max(probe_count, std::min(std::max(center_probe_ef_cap_, probe_count * 2), center_count_));
+                if (trace) trace->center_probe_ef = center_probe_ef;
                 std::vector<int> center_cand = search_layer_csr(
                     query,
                     std::vector<int>{decision.center_id},
                     centers_,
+                    &centers_sq_norms_,
+                    query_sq_norm,
                     center_count_,
                     dim_,
                     center_graph_,
                     center_probe_ef,
-                    center_ws
+                    center_ws,
+                    trace ? &trace->center_layer : nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    &accum_distance_ms,
+                    &accum_jump_ms
                 );
                 if (center_cand.empty()) {
                     probe_ids.push_back(decision.center_id);
                 } else {
-                    if (static_cast<int>(center_cand.size()) > probe_count) {
-                        center_cand.resize(probe_count);
+                    if (trace) trace->center_candidates = static_cast<int64_t>(center_cand.size());
+                    if (rabitq_enabled_ && static_cast<int>(center_cand.size()) >= rabitq_min_scan_) {
+                        center_cand = rabitq_rank_candidates(query, center_cand, true, std::min(rabitq_center_keep_, static_cast<int>(center_cand.size())));
+                    } else if (static_cast<int>(center_cand.size()) > std::max(probe_count * 2, probe_count)) {
+                        center_cand.resize(static_cast<size_t>(std::max(probe_count * 2, probe_count)));
                     }
-                    probe_ids = exact_sorted_ids(query, centers_, dim_, center_cand);
+                    probe_ids = exact_sorted_ids(query, centers_, dim_, center_cand, &centers_sq_norms_, query_sq_norm);
                     if (static_cast<int>(probe_ids.size()) > probe_count) {
-                        probe_ids.resize(probe_count);
+                        probe_ids.resize(static_cast<size_t>(probe_count));
                     }
                 }
             }
         }
+        const double center_search_ms = now_ms_clock() - center_search_t0_ms;
+        if (trace) trace->center_search_ms = center_search_ms;
 
-        std::vector<int> entry_points;
-        entry_points.reserve(static_cast<size_t>(probe_ids.size() * std::max(1, anchor_k_) + 2));
+        const double entry_t0_ms = now_ms_clock();
+        auto& entry_points = base_ws.scratch_ids_a;
+        entry_points.clear();
+        const int real_take_per_center = (probe_count <= 2 ? 2 : 1);
+        entry_points.reserve(static_cast<size_t>(probe_ids.size() * (real_take_per_center + std::max(1, anchor_k_)) + 2));
 
+        int64_t direct_real_entries = 0;
+        int64_t anchor_entries = 0;
+        int64_t fallback_entries = 0;
+        for (int cid : probe_ids) {
+            auto direct_real = get_center_real_entry_points(cid, query, real_take_per_center);
+            direct_real_entries += static_cast<int64_t>(direct_real.size());
+            entry_points.insert(entry_points.end(), direct_real.begin(), direct_real.end());
+        }
         for (int cid : probe_ids) {
             auto anchors = get_center_anchors(cid);
+            anchor_entries += static_cast<int64_t>(anchors.size());
             entry_points.insert(entry_points.end(), anchors.begin(), anchors.end());
         }
-
         if (base_entry_ >= center_count_) {
             entry_points.push_back(base_entry_);
+            fallback_entries += 1;
         }
-
         if (entry_points.empty()) {
-            if (center_count_ < base_count_) {
-                entry_points.push_back(center_count_);
-            } else {
-                entry_points.push_back(0);
-            }
+            if (center_count_ < base_count_) entry_points.push_back(center_count_);
+            else entry_points.push_back(0);
+            fallback_entries += 1;
         }
-
+        if (trace) {
+            trace->direct_real_entries = direct_real_entries;
+            trace->anchor_entries = anchor_entries;
+            trace->fallback_entries = fallback_entries;
+            trace->entry_points_raw = static_cast<int64_t>(entry_points.size());
+        }
         entry_points = unique_keep_order(entry_points);
+        if (trace) trace->entry_points_before_cap = static_cast<int64_t>(entry_points.size());
+        if (static_cast<int>(entry_points.size()) > entry_points_cap_) {
+            entry_points = exact_sorted_ids(query, base_vectors_, dim_, entry_points, &base_sq_norms_, query_sq_norm);
+            entry_points.resize(static_cast<size_t>(entry_points_cap_));
+        }
+        if (trace) trace->entry_points_after_cap = static_cast<int64_t>(entry_points.size());
+        const double entry_select_ms = now_ms_clock() - entry_t0_ms;
+        if (trace) trace->entry_select_ms = entry_select_ms;
 
         int ef_internal = std::min(
             std::max(ef, k) + adaptive_extra(probe_count, decision.margin, k, ef),
             base_count_
         );
+        if (trace) trace->ef_internal = ef_internal;
 
+        const CSRGraph& qgraph = (query_graph_.n_nodes() == base_count_) ? query_graph_ : base_graph_;
+        if (trace) trace->used_query_graph = (query_graph_.n_nodes() == base_count_) ? 1 : 0;
+        int64_t bridge_edges_traversed = 0;
+        int64_t bridge_targets_visited = 0;
+        const double base_search_t0_ms = now_ms_clock();
         std::vector<int> cand = search_layer_csr(
             query,
             entry_points,
             base_vectors_,
+            &base_sq_norms_,
+            query_sq_norm,
             base_count_,
             dim_,
-            base_graph_,
+            qgraph,
             ef_internal,
-            base_ws
+            base_ws,
+            trace ? &trace->base_layer : nullptr,
+            (trace && qgraph.n_nodes() == base_count_) ? &cross_partition_bridge_out_ : nullptr,
+            trace ? &bridge_edges_traversed : nullptr,
+            trace ? &bridge_targets_visited : nullptr,
+            &accum_distance_ms,
+            &accum_jump_ms
         );
+        const double base_search_ms = now_ms_clock() - base_search_t0_ms;
+        if (trace) {
+            trace->base_search_ms = base_search_ms;
+            trace->bridge_edges_traversed = bridge_edges_traversed;
+            trace->bridge_targets_visited = bridge_targets_visited;
+            trace->bridge_used = bridge_edges_traversed > 0 ? 1 : 0;
+            trace->final_candidates = static_cast<int64_t>(cand.size());
+        }
 
-        std::vector<CandidateDist> real;
+        const double rerank_t0_ms = now_ms_clock();
+        auto& real = base_ws.scratch_real;
+        real.clear();
         real.reserve(cand.size());
         for (int gid : cand) {
             if (gid < center_count_) continue;
-            real.push_back({gid - center_count_, l2_sq_ptr(query, &base_vectors_[static_cast<size_t>(gid) * dim_], dim_)});
+            const double dist_t0_ms = now_ms_clock();
+            float dist = l2_sq_query_to_vec_normed(query, query_sq_norm, &base_vectors_[static_cast<size_t>(gid) * dim_], base_sq_norms_[static_cast<size_t>(gid)], dim_);
+            accum_distance_ms += (now_ms_clock() - dist_t0_ms);
+            real.push_back({gid - center_count_, dist});
         }
 
         if (real.empty()) {
             for (int gid = center_count_; gid < base_count_; ++gid) {
-                real.push_back({gid - center_count_, l2_sq_ptr(query, &base_vectors_[static_cast<size_t>(gid) * dim_], dim_)});
+                const double dist_t0_ms = now_ms_clock();
+                float dist = l2_sq_query_to_vec_normed(query, query_sq_norm, &base_vectors_[static_cast<size_t>(gid) * dim_], base_sq_norms_[static_cast<size_t>(gid)], dim_);
+                accum_distance_ms += (now_ms_clock() - dist_t0_ms);
+                real.push_back({gid - center_count_, dist});
             }
         }
+        if (trace) trace->final_real_candidates = static_cast<int64_t>(real.size());
 
         int topk = std::min(k, static_cast<int>(real.size()));
+        if (trace) trace->topk = topk;
         std::nth_element(
             real.begin(),
             real.begin() + topk - 1,
@@ -1673,12 +3003,18 @@ private:
         std::vector<float> dists;
         ids.reserve(static_cast<size_t>(topk));
         dists.reserve(static_cast<size_t>(topk));
-
         for (const auto& x : real) {
             ids.push_back(x.id);
             dists.push_back(x.dist);
         }
+        const double final_rerank_ms = now_ms_clock() - rerank_t0_ms;
 
+        if (trace) {
+            trace->final_rerank_ms = final_rerank_ms;
+            trace->distance_ms = accum_distance_ms;
+            trace->jump_ms = accum_jump_ms;
+            trace->total_ms = now_ms_clock() - query_t0_ms;
+        }
         return {ids, dists};
     }
 
@@ -1770,10 +3106,13 @@ private:
             if (entry_points.empty()) entry_points.push_back(0);
 
             int effective_ef = std::min(ef_construction_, std::max(1, idx));
+            const float query_sq_norm = base_sq_norms_[static_cast<size_t>(idx)];
             std::vector<int> cand = search_layer_list(
                 query,
                 entry_points,
                 base_vectors_,
+                &base_sq_norms_,
+                query_sq_norm,
                 idx,
                 dim_,
                 base_adj_,
@@ -1797,7 +3136,7 @@ private:
 };
 
 PYBIND11_MODULE(_tlhl_cpp, m) {
-    m.doc() = "TLHL C++ core stage 7";
+    m.doc() = "TLHL C++ core stage 12 ambiguous cross-partition quota";
 
     py::class_<TLHLCore>(m, "TLHLCore")
         .def(
@@ -1860,5 +3199,24 @@ PYBIND11_MODULE(_tlhl_cpp, m) {
              py::arg("k") = 10,
              py::arg("ef") = 50,
              py::arg("n_probe_centers") = 1)
-        .def("summary", &TLHLCore::summary);
+        .def("summary", &TLHLCore::summary)
+        .def("set_cross_partition_locality", &TLHLCore::set_cross_partition_locality,
+             py::arg("enabled"),
+             py::arg("top_centers") = 3,
+             py::arg("extra_partitions") = 2,
+             py::arg("local_topk") = 8,
+             py::arg("search_ef") = 32,
+             py::arg("out_degree_per_part") = 2,
+             py::arg("radius_mul") = 1.25f,
+             py::arg("query_cross_partition_quota") = 1,
+             py::arg("ambiguity_rel_gap") = 0.10f)
+        .def("set_rabitq", &TLHLCore::set_rabitq,
+             py::arg("enabled"),
+             py::arg("bits") = 64,
+             py::arg("center_keep") = 16,
+             py::arg("pool_keep") = 24,
+             py::arg("min_scan") = 24)
+        .def("last_query_stats", &TLHLCore::last_query_stats)
+        .def("last_batch_stats", &TLHLCore::last_batch_stats)
+        .def("reset_query_stats", &TLHLCore::reset_query_stats);
 }
